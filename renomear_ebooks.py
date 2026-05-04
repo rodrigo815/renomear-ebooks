@@ -26,7 +26,34 @@ except Exception:
     PdfReader = None
 
 
-SUPPORTED_EXTS = {".epub", ".pdf", ".mobi", ".azw", ".azw3", ".djvu"}
+SUPPORTED_EXTS = frozenset({".epub", ".pdf", ".mobi", ".azw", ".azw3", ".djvu"})
+
+
+def parse_exts_csv(raw: str) -> frozenset[str]:
+    """Lista separada por virgula: aceita com ou sem ponto; normaliza para minusculas com ponto."""
+    parts = [p.strip() for p in (raw or "").split(",") if p.strip()]
+    if not parts:
+        raise ValueError("lista de extensoes vazia")
+    out: set[str] = set()
+    for p in parts:
+        e = p.lower()
+        if not e.startswith("."):
+            e = "." + e
+        out.add(e)
+    unknown = out - SUPPORTED_EXTS
+    if unknown:
+        unk = ", ".join(sorted(unknown))
+        print(
+            f"Aviso: extensoes ignoradas (nao suportadas): {unk}",
+            file=sys.stderr,
+        )
+    allowed = frozenset(out & SUPPORTED_EXTS)
+    if not allowed:
+        raise ValueError(
+            "nenhuma extensao valida apos filtrar; suportadas: "
+            + ", ".join(sorted(SUPPORTED_EXTS))
+        )
+    return allowed
 # Nomes de pastas (em minusculas) a ignorar na varredura; vazio = nenhuma.
 # Ex.: frozenset({"anarquismo"}) — use so localmente se precisar, sem commitar.
 IGNORED_DIR_NAMES: frozenset[str] = frozenset()
@@ -65,6 +92,7 @@ class BookMeta:
     authors: list[str] | None = None
     year: str = ""
     isbn: str = ""
+    publisher: str = ""
     source: str = ""
     confidence: float = 0.0
     notes: str = ""
@@ -270,6 +298,88 @@ def extract_year_candidates(s: str) -> list[int]:
         if 1450 <= yi <= current_year + 1:
             years.append(yi)
     return years
+
+
+# Grupos (site: a OR site: b) no DuckDuckGo para cata anos em snippets sem API/chave.
+# Referencias: WorldCat, Goodreads, StoryGraph, LibraryThing, BookBrowse, BookBrainz,
+# Amazon Books, ISBNdb — ver README.
+DDG_CATALOG_SITE_GROUPS: tuple[tuple[str, ...], ...] = (
+    ("worldcat.org", "goodreads.com", "thestorygraph.com"),
+    ("librarything.com", "bookbrowse.com", "bookbrainz.org"),
+    ("amazon.com", "isbndb.com"),
+)
+
+# Ordem logica do pipeline remoto (subconjuntos sao respeitados via frozenset).
+REMOTE_SOURCE_KEYS: tuple[str, ...] = (
+    "openlibrary",
+    "google",
+    "skoob",
+    "catalogs",
+    "wikipedia",
+    "web",
+)
+ALL_REMOTE_SOURCES: frozenset[str] = frozenset(REMOTE_SOURCE_KEYS)
+
+# Velocidade 1 = mais fontes (mais lento); 5 = menos fontes (mais rapido).
+SEARCH_SPEED_TO_SOURCES: dict[int, frozenset[str]] = {
+    1: ALL_REMOTE_SOURCES,
+    2: frozenset({"openlibrary", "google", "skoob", "catalogs", "wikipedia"}),
+    3: frozenset({"openlibrary", "google", "skoob", "catalogs"}),
+    4: frozenset({"openlibrary", "google", "skoob"}),
+    5: frozenset({"openlibrary", "google"}),
+}
+
+
+def parse_remote_sources_csv(raw: str) -> frozenset[str]:
+    """Lista separada por virgula: openlibrary, google, skoob, catalogs, wikipedia, web."""
+    parts = [p.strip().lower() for p in (raw or "").split(",") if p.strip()]
+    aliases = {
+        "googlebooks": "google",
+        "gb": "google",
+        "ol": "openlibrary",
+        "open-library": "openlibrary",
+        "wiki": "wikipedia",
+    }
+    out: set[str] = set()
+    for p in parts:
+        p = aliases.get(p, p)
+        if p not in ALL_REMOTE_SOURCES:
+            allowed = ", ".join(sorted(ALL_REMOTE_SOURCES))
+            raise ValueError(f"fonte desconhecida '{p}'; permitidas: {allowed}")
+        out.add(p)
+    if not out:
+        raise ValueError("lista de fontes vazia em --sources")
+    return frozenset(out)
+
+
+def publication_adjacent_years(text: str) -> list[int]:
+    """Anos perto de expressoes de publicacao/edicao em texto solto (HTML, snippets)."""
+    patterns = [
+        r"(?i)(?:publication date|published|released|launch(?:ed)?|copyright|©|data de publica[cç][aã]o|publicado|lan[cç]amento|edi[cç][aã]o)[^\n]{0,90}\b(1[4-9]\d{2}|20\d{2})\b",
+        r"(?i)\b(1[4-9]\d{2}|20\d{2})\b[^\n]{0,90}(?:publication date|published|released|launch(?:ed)?|copyright|©|data de publica[cç][aã]o|publicado|lan[cç]amento|edi[cç][aã]o)",
+    ]
+    out: list[int] = []
+    for pat in patterns:
+        for m in re.finditer(pat, text):
+            out.extend(extract_year_candidates(m.group(0)))
+    return out
+
+
+def years_near_substrings(text: str, needles: tuple[str, ...], window: int = 120) -> list[int]:
+    """Anos em janelas ao redor de substrings (ex.: dominios em resultados de busca)."""
+    out: list[int] = []
+    tl = text.lower()
+    for needle in needles:
+        nl = needle.lower()
+        start = 0
+        while True:
+            i = tl.find(nl, start)
+            if i == -1:
+                break
+            chunk = text[max(0, i - window) : i + len(needle) + window]
+            out.extend(extract_year_candidates(chunk))
+            start = i + 1
+    return out
 
 
 def year_from_string(s: str, prefer: str = "first") -> str:
@@ -493,12 +603,16 @@ def read_epub_metadata(path: Path) -> BookMeta:
             creators = texts("creator")
             identifiers = texts("identifier")
             dates = texts("date")
+            publishers = texts("publisher")
 
             if titles:
                 meta.title = clean_title(titles[0])
 
             if creators:
                 meta.authors = split_authors(creators)
+
+            if publishers:
+                meta.publisher = compact_spaces(publishers[0])
 
             if identifiers:
                 meta.isbn = find_isbn(" ".join(identifiers))
@@ -830,6 +944,7 @@ def best_googlebooks(meta: BookMeta, cache: dict[str, Any], sleep_s: float) -> B
 
     score, info = best
     year = year_from_string(str(info.get("publishedDate", "")))
+    pub = compact_spaces(str(info.get("publisher") or ""))
 
     return BookMeta(
         meta.path,
@@ -837,6 +952,7 @@ def best_googlebooks(meta: BookMeta, cache: dict[str, Any], sleep_s: float) -> B
         authors=split_authors(info.get("authors", [])[:3]) or meta.authors,
         year=year,
         isbn=meta.isbn,
+        publisher=pub,
         source="googlebooks",
         confidence=round(score / 100, 3),
     )
@@ -936,17 +1052,6 @@ def best_web_year(
         f"\"{base_title}\" \"{author}\" wikipedia",
     ]
 
-    def contextual_years(text: str) -> list[int]:
-        patterns = [
-            r"(?i)(?:publication date|published|released|launch(?:ed)?|copyright|©|data de publica[cç][aã]o|publicado|lan[cç]amento)[^\n]{0,90}\b(1[4-9]\d{2}|20\d{2})\b",
-            r"(?i)\b(1[4-9]\d{2}|20\d{2})\b[^\n]{0,90}(?:publication date|published|released|launch(?:ed)?|copyright|©|data de publica[cç][aã]o|publicado|lan[cç]amento)",
-        ]
-        out: list[int] = []
-        for pat in patterns:
-            for m in re.finditer(pat, text):
-                out.extend(extract_year_candidates(m.group(0)))
-        return out
-
     years: list[int] = []
     for q in probes:
         data = get_json(
@@ -959,7 +1064,7 @@ def best_web_year(
             continue
         text = re.sub(r"<[^>]+>", " ", data)
         text = compact_spaces(text)
-        years.extend(contextual_years(text))
+        years.extend(publication_adjacent_years(text))
 
     if not years:
         return None
@@ -973,6 +1078,103 @@ def best_web_year(
         isbn=meta.isbn,
         source="web:duckduckgo(zlib+amazon+estante+wikipedia+bibliography)",
         confidence=0.45,
+    )
+
+
+def best_skoob_year(
+    meta: BookMeta,
+    cache: dict[str, Any],
+    sleep_s: float,
+    year_strategy: str = "original",
+) -> BookMeta | None:
+    """Tenta ano a partir de resultados do Skoob via DuckDuckGo (site:skoob.com.br).
+
+    A busca direta em skoob.com.br costuma exigir login; snippets indexados
+    ainda costumam trazer titulo/autor e ano de edicao.
+    """
+    if not meta.title:
+        return None
+
+    base_title = title_variants(meta.title)[0] if title_variants(meta.title) else meta.title
+    author = meta.authors[0] if meta.authors else ""
+
+    probes: list[str]
+    if author:
+        probes = [
+            f'"{base_title}" "{author}" site:skoob.com.br',
+            f'"{base_title}" site:skoob.com.br',
+        ]
+    else:
+        probes = [f'"{base_title}" site:skoob.com.br']
+
+    years: list[int] = []
+    for q in probes:
+        data = get_json("https://duckduckgo.com/html/", {"q": q}, cache, sleep_s)
+        if not isinstance(data, str):
+            continue
+        text = re.sub(r"<[^>]+>", " ", data)
+        text = compact_spaces(text)
+        years.extend(publication_adjacent_years(text))
+        years.extend(years_near_substrings(text, ("skoob.com.br",)))
+
+    if not years:
+        return None
+
+    y = str(max(years) if year_strategy == "edition" else min(years))
+    return BookMeta(
+        meta.path,
+        title=meta.title,
+        authors=meta.authors,
+        year=y,
+        isbn=meta.isbn,
+        source="skoob:duckduckgo(site:skoob.com.br)",
+        confidence=0.48,
+    )
+
+
+def best_book_catalogs_ddgs_year(
+    meta: BookMeta,
+    cache: dict[str, Any],
+    sleep_s: float,
+    year_strategy: str = "original",
+) -> BookMeta | None:
+    """Ano a partir de snippets do DDG restritos a varios catalogos (sem API/chave).
+
+    Cada grupo em DDG_CATALOG_SITE_GROUPS vira uma busca (site:a OR site:b ...).
+    """
+    if not meta.title:
+        return None
+
+    base_title = title_variants(meta.title)[0] if title_variants(meta.title) else meta.title
+    author = meta.authors[0] if meta.authors else ""
+
+    years: list[int] = []
+    for domains in DDG_CATALOG_SITE_GROUPS:
+        site_clause = "(" + " OR ".join(f"site:{d}" for d in domains) + ")"
+        if author:
+            q = f'"{base_title}" "{author}" {site_clause}'
+        else:
+            q = f'"{base_title}" {site_clause}'
+        data = get_json("https://duckduckgo.com/html/", {"q": q}, cache, sleep_s)
+        if not isinstance(data, str):
+            continue
+        text = re.sub(r"<[^>]+>", " ", data)
+        text = compact_spaces(text)
+        years.extend(publication_adjacent_years(text))
+        years.extend(years_near_substrings(text, domains))
+
+    if not years:
+        return None
+
+    y = str(max(years) if year_strategy == "edition" else min(years))
+    return BookMeta(
+        meta.path,
+        title=meta.title,
+        authors=meta.authors,
+        year=y,
+        isbn=meta.isbn,
+        source="catalogs:duckduckgo(worldcat+goodreads+storygraph+lt+bookbrowse+bookbrainz+amazon+isbndb)",
+        confidence=0.46,
     )
 
 
@@ -1036,6 +1238,7 @@ def merge_metadata(local: BookMeta, remote: BookMeta | None, prefer_remote_title
         out.authors = local_authors or remote_authors or []
     out.year = remote.year or local.year
     out.isbn = local.isbn or remote.isbn
+    out.publisher = (local.publisher or "").strip() or (remote.publisher or "").strip()
     out.source = f"{local.source}+{remote.source}"
     out.confidence = max(local.confidence, remote.confidence)
 
@@ -1054,19 +1257,19 @@ def merge_metadata(local: BookMeta, remote: BookMeta | None, prefer_remote_title
 
 def lookup_metadata(
     meta: BookMeta,
-    source: str,
+    enabled_remote_sources: frozenset[str],
     cache: dict[str, Any],
     sleep_s: float,
     prefer_remote_title: bool,
     year_strategy: str = "original",
+    skip_author_enrich: bool = False,
 ) -> BookMeta:
-    source = source.lower()
     remote: BookMeta | None = None
 
-    if source in {"openlibrary", "all"}:
+    if "openlibrary" in enabled_remote_sources:
         remote = best_openlibrary(meta, cache, sleep_s, year_strategy=year_strategy)
 
-    if (not remote or not remote.year) and source in {"google", "googlebooks", "all"}:
+    if (not remote or not remote.year) and "google" in enabled_remote_sources:
         gb = best_googlebooks(meta, cache, sleep_s)
 
         if not remote:
@@ -1077,14 +1280,28 @@ def lookup_metadata(
             if not remote.authors:
                 remote.authors = gb.authors
 
-    if (not remote or not remote.year) and source in {"wikipedia", "all"}:
+    if (not remote or not remote.year) and "skoob" in enabled_remote_sources:
+        sk = best_skoob_year(meta, cache, sleep_s, year_strategy=year_strategy)
+        if not remote:
+            remote = sk
+        elif sk and not remote.year:
+            remote.year = sk.year
+
+    if (not remote or not remote.year) and "catalogs" in enabled_remote_sources:
+        cat = best_book_catalogs_ddgs_year(meta, cache, sleep_s, year_strategy=year_strategy)
+        if not remote:
+            remote = cat
+        elif cat and not remote.year:
+            remote.year = cat.year
+
+    if (not remote or not remote.year) and "wikipedia" in enabled_remote_sources:
         wk = best_wikipedia(meta, cache, sleep_s, year_strategy=year_strategy)
         if not remote:
             remote = wk
         elif wk and not remote.year:
             remote.year = wk.year
 
-    if (not remote or not remote.year) and source in {"web", "all"}:
+    if (not remote or not remote.year) and "web" in enabled_remote_sources:
         web = best_web_year(meta, cache, sleep_s, year_strategy=year_strategy)
         if not remote:
             remote = web
@@ -1092,7 +1309,7 @@ def lookup_metadata(
             remote.year = web.year
 
     merged = merge_metadata(meta, remote, prefer_remote_title=prefer_remote_title)
-    if authors_need_enrichment(merged.authors):
+    if not skip_author_enrich and authors_need_enrichment(merged.authors):
         merged.authors = enrich_weak_authors_from_web(merged, cache, sleep_s)
     return merged
 
@@ -1171,13 +1388,19 @@ def format_authors(authors: list[str], overrides: dict[str, str], max_authors: i
     return "; ".join(format_one_author(a, overrides) for a in authors)
 
 
-def make_new_filename(
+_FILENAME_PLACEHOLDER_RE = re.compile(
+    r"%(?P<key>AUTHOR|DATE|TITLE|PUBLISHER|FORMAT)%",
+    re.I,
+)
+
+
+def default_filename_stem(
     meta: BookMeta,
-    ext: str,
     overrides: dict[str, str],
     max_authors: int,
     unknown_year: str,
 ) -> str:
+    """Parte do nome sem extensao no padrao historico: AUTOR - ANO - TITULO."""
     title = safe_filename_part(meta.title or Path(meta.path).stem, max_len=120)
     author_part = safe_filename_part(format_authors(meta.authors or [], overrides, max_authors), max_len=90)
     year = meta.year or ("s.d." if unknown_year == "sd" else "")
@@ -1191,9 +1414,63 @@ def make_new_filename(
     else:
         base = title
 
-    base = safe_filename_part(base, max_len=190)
+    return safe_filename_part(base, max_len=190)
 
-    return base + ext.lower()
+
+def make_new_filename(
+    meta: BookMeta,
+    ext: str,
+    overrides: dict[str, str],
+    max_authors: int,
+    unknown_year: str,
+    filename_pattern: str = "",
+) -> str:
+    ext_l = ext.lower()
+    if not ext_l.startswith("."):
+        ext_l = "." + ext_l
+
+    pattern = compact_spaces(filename_pattern)
+    if not pattern:
+        return default_filename_stem(meta, overrides, max_authors, unknown_year) + ext_l
+
+    author_fmt = safe_filename_part(
+        format_authors(meta.authors or [], overrides, max_authors),
+        max_len=120,
+    )
+    if unknown_year == "sd":
+        date_fmt = meta.year or "s.d."
+    else:
+        date_fmt = meta.year or ""
+    title_fmt = safe_filename_part(meta.title or Path(meta.path).stem, max_len=140)
+    publisher_fmt = safe_filename_part(meta.publisher or "", max_len=100)
+    format_fmt = ext_l
+
+    def repl(m: re.Match[str]) -> str:
+        k = m.group("key").upper()
+        if k == "AUTHOR":
+            return author_fmt
+        if k == "DATE":
+            return date_fmt
+        if k == "TITLE":
+            return title_fmt
+        if k == "PUBLISHER":
+            return publisher_fmt
+        if k == "FORMAT":
+            return format_fmt
+        return m.group(0)
+
+    has_format = bool(re.search(r"%FORMAT%", pattern, flags=re.I))
+    stem = _FILENAME_PLACEHOLDER_RE.sub(repl, pattern)
+    stem = compact_spaces(stem)
+    stem = safe_filename_part(stem, max_len=200)
+
+    if not stem or stem == "sem_nome":
+        return default_filename_stem(meta, overrides, max_authors, unknown_year) + ext_l
+
+    if not has_format:
+        stem = stem + ext_l
+
+    return stem
 
 
 def unique_target(src: Path, filename: str, target_dir: Path, reserved: set[Path]) -> Path:
@@ -1216,9 +1493,15 @@ def unique_target(src: Path, filename: str, target_dir: Path, reserved: set[Path
     return target
 
 
-def iter_files(folder: Path, recursive: bool, exclude_dir: Path | None = None) -> list[Path]:
+def iter_files(
+    folder: Path,
+    recursive: bool,
+    exclude_dir: Path | None = None,
+    allowed_exts: frozenset[str] | None = None,
+) -> list[Path]:
     pattern = "**/*" if recursive else "*"
     exclude_dir_resolved = exclude_dir.resolve() if exclude_dir else None
+    exts = allowed_exts if allowed_exts is not None else SUPPORTED_EXTS
 
     def should_ignore_path(p: Path) -> bool:
         for parent in p.resolve().parents:
@@ -1229,11 +1512,16 @@ def iter_files(folder: Path, recursive: bool, exclude_dir: Path | None = None) -
                 return True
         return False
 
+    def allow_suffix(suf: str) -> bool:
+        s = suf.lower()
+        if allowed_exts is None:
+            return s in SUPPORTED_EXTS and s != ".html"
+        return s in exts
+
     files = [
         p for p in folder.glob(pattern)
         if p.is_file()
-        and p.suffix.lower() in SUPPORTED_EXTS
-        and p.suffix.lower() != ".html"
+        and allow_suffix(p.suffix)
         and (
             exclude_dir_resolved is None
             or exclude_dir_resolved not in p.resolve().parents
@@ -1313,13 +1601,18 @@ def run_on_root(folder: Path, args: argparse.Namespace) -> tuple[int, int, Path,
     overrides = load_json(overrides_path)
 
     exclude_dir = output_dir if output_dir != folder else None
-    files = iter_files(folder, args.recursive, exclude_dir=exclude_dir)
+    files = iter_files(
+        folder,
+        args.recursive,
+        exclude_dir=exclude_dir,
+        allowed_exts=args.ext_filter,
+    )
     if args.limit and args.limit > 0:
         files = files[: args.limit]
 
     local_pairs = build_local_metadata(
         files,
-        max_pdf_pages=args.max_pdf_pages,
+        max_pdf_pages=args.effective_max_pdf_pages,
         year_strategy=args.year_strategy,
         jobs=max(1, args.jobs),
     )
@@ -1334,18 +1627,19 @@ def run_on_root(folder: Path, args: argparse.Namespace) -> tuple[int, int, Path,
     for path, local in local_pairs:
         should_use_offline = (
             args.source == "offline"
-            or (local.year and not args.force_remote)
+            or (local.year and not args.effective_force_remote)
         )
         if should_use_offline:
             meta = local
         else:
             meta = lookup_metadata(
                 local,
-                args.source,
+                args.enabled_remote_sources,
                 cache,
-                sleep_s=args.sleep,
+                sleep_s=args.effective_sleep,
                 prefer_remote_title=args.prefer_remote_title,
                 year_strategy=args.year_strategy,
+                skip_author_enrich=args.skip_author_enrich,
             )
 
         new_name = make_new_filename(
@@ -1354,6 +1648,7 @@ def run_on_root(folder: Path, args: argparse.Namespace) -> tuple[int, int, Path,
             overrides,
             args.max_authors,
             args.unknown_year,
+            filename_pattern=args.filename_pattern,
         )
 
         target = unique_target(path, new_name, output_dir, reserved)
@@ -1398,6 +1693,7 @@ def run_on_root(folder: Path, args: argparse.Namespace) -> tuple[int, int, Path,
                 overrides,
                 args.max_authors,
                 "sd",
+                filename_pattern=args.filename_pattern,
             )
             missing_year_rows.append(
                 {
@@ -1463,7 +1759,7 @@ def main() -> int:
         formatter_class=_HelpFormatter,
         description=(
             "Renomeia e-books (EPUB, PDF, MOBI, AZW/AZW3, DJVU) para o padrao:\n"
-            "  SOBRENOME, Nome - Ano - Titulo.ext\n\n"
+            "  SOBRENOME, Nome - Ano - Titulo.ext (ou --filename-pattern personalizado)\n\n"
             "Por padrao, so arquivos diretamente em cada PASTA sao listados; use --recursive "
             "para incluir subpastas.\n"
             "Os arquivos renomeados vao para a subpasta 'renamed' dentro de cada pasta informada "
@@ -1486,6 +1782,18 @@ def main() -> int:
             "    python renomear_ebooks.py \"C:\\Livros\" --source all --apply\n\n"
             "  Forcar rede mesmo quando o PDF ja trouxe um ano (revalidar):\n"
             "    python renomear_ebooks.py \"C:\\Livros\" --source all --force-remote\n\n"
+            "  Modo rapido (menos rede e menos leitura de PDF):\n"
+            "    python renomear_ebooks.py \"C:\\Livros\" --source all --fast --quiet\n\n"
+            "  Modo minucioso (mais PDF + todas as fontes + rede mesmo com ano local):\n"
+            "    python renomear_ebooks.py \"C:\\Livros\" --source all --thorough\n\n"
+            "  Velocidade de busca 1 a 5 (so um de --fast, --thorough ou --search-speed):\n"
+            "    python renomear_ebooks.py \"C:\\Livros\" --source all --search-speed 3 --quiet\n\n"
+            "  Escolher fontes manualmente (com --source all):\n"
+            "    python renomear_ebooks.py \"C:\\Livros\" --source all "
+            "--sources openlibrary,google,wikipedia --quiet\n\n"
+            "  Nome de ficheiro personalizado:\n"
+            "    python renomear_ebooks.py \"C:\\Livros\" --filename-pattern "
+            "\"%DATE%_%AUTHOR% - %TITLE%%FORMAT%\" --quiet\n\n"
             "Overrides de autores: arquivo JSON (chave = como aparece no metadado/nome; "
             "valor = formato desejado), padrao author_overrides.json na pasta-alvo.\n"
             "Veja README.md na mesma pasta do script para detalhes."
@@ -1511,16 +1819,40 @@ def main() -> int:
         action="store_true",
         help="Inclui arquivos em todas as subpastas de cada PASTA (sem esta flag, so o nivel raiz).",
     )
+    ap.add_argument(
+        "--exts",
+        default="",
+        metavar="EXTS",
+        help=(
+            "Lista separada por virgula de extensoes a incluir (ex.: pdf,epub ou .PDF,.epub). "
+            "Case-insensitive; com ou sem ponto. So tipos suportados entram; sem esta flag, "
+            "usa o conjunto padrao e ignora .html."
+        ),
+    )
 
     ap.add_argument(
         "--source",
-        choices=["offline", "openlibrary", "google", "wikipedia", "web", "all"],
+        choices=["offline", "openlibrary", "google", "skoob", "catalogs", "wikipedia", "web", "all"],
         default="all",
         help=(
             "Fonte(s) para completar metadado remoto (principalmente ano). "
             "'offline' nao acessa a rede. "
-            "'all' tenta Open Library + Google Books + Wikipedia + busca web (fallback). "
-            "Se o ano ja foi encontrado na leitura local, a rede e pulada salvo --force-remote."
+            "'all' tenta Open Library, Google Books, Skoob (DDG site:skoob.com.br), "
+            "catalogos agregados (DDG site: worldcat, goodreads, storygraph, librarything, "
+            "bookbrowse, bookbrainz, amazon, isbndb), Wikipedia e busca web (fallback). "
+            "Se o ano ja foi encontrado na leitura local, a rede e pulada salvo --force-remote. "
+            "Combine com --sources ou --search-speed (exige --source all)."
+        ),
+    )
+
+    ap.add_argument(
+        "--sources",
+        default="",
+        metavar="LISTA",
+        help=(
+            "Filtra quais fontes remotas usar (virgula). Valores: openlibrary, google, skoob, "
+            "catalogs, wikipedia, web. Ex.: openlibrary,google,wikipedia. Exige --source all. "
+            "Tem precedencia sobre --search-speed e sobre o subconjunto implicito de --fast."
         ),
     )
 
@@ -1542,6 +1874,18 @@ def main() -> int:
         choices=["sd", "omit"],
         default="sd",
         help="Como preencher o ano quando desconhecido: 'sd' insere s.d.; 'omit' omite o segmento de ano.",
+    )
+    ap.add_argument(
+        "--filename-pattern",
+        default="",
+        metavar="PADRAO",
+        help=(
+            "Modelo do nome do ficheiro em renamed/. Marcadores (case-insensitive): "
+            "%%AUTHOR%%, %%DATE%% (ano; vazio ou s.d. conforme --unknown-year), %%TITLE%%, "
+            "%%PUBLISHER%% (ex.: metadado EPUB), %%FORMAT%% (extensao com ponto, ex. .epub). "
+            "Se nao usar %%FORMAT%%, a extensao e acrescentada no fim. "
+            "Sem esta flag: padrao SOBRENOME, Nome - Ano - Titulo.ext"
+        ),
     )
     ap.add_argument(
         "--year-strategy",
@@ -1566,6 +1910,40 @@ def main() -> int:
         type=float,
         default=0.25,
         help="Pausa em segundos entre requisicoes HTTP (evita limitar APIs).",
+    )
+
+    perf = ap.add_mutually_exclusive_group()
+    perf.add_argument(
+        "--fast",
+        action="store_true",
+        help=(
+            "Prioriza velocidade: pausa HTTP efetiva 0s; le no maximo 1 pagina de PDF por arquivo; "
+            "sem --sources, equivale a --search-speed 5 (Open Library + Google Books; pula Skoob, "
+            "catalogs, Wikipedia, web e enriquecimento extra de autores). Com --sources, mantem "
+            "pausa/PDF rapidos mas consulta so as fontes listadas."
+        ),
+    )
+    perf.add_argument(
+        "--thorough",
+        action="store_true",
+        help=(
+            "Prioriza consistencia: pausa HTTP maior (min. 0.35s); le no minimo 5 paginas de PDF "
+            "(ate 15); forca metadado remoto mesmo se ja houver ano local; com --source all usa "
+            "todas as fontes (incl. Skoob, catalogs agregados, Wikipedia e web). "
+            "Equivale a --search-speed 1 com mais rede/PDF forcados."
+        ),
+    )
+    perf.add_argument(
+        "--search-speed",
+        type=int,
+        choices=[1, 2, 3, 4, 5],
+        default=None,
+        metavar="N",
+        help=(
+            "Velocidade da busca remota (1 = mais lenta, mais fontes; 5 = mais rapida, so "
+            "Open Library + Google Books). Ajusta tambem pausa HTTP, leitura de PDF e enriquecimento "
+            "de autores. Incompativel com --fast e --thorough (use uma ou outra)."
+        ),
     )
 
     ap.add_argument(
@@ -1618,6 +1996,99 @@ def main() -> int:
 
     args = ap.parse_args()
 
+    try:
+        sources_parsed = (
+            parse_remote_sources_csv(args.sources)
+            if compact_spaces(args.sources)
+            else None
+        )
+    except ValueError as e:
+        print(f"Erro em --sources: {e}", file=sys.stderr)
+        return 2
+
+    if args.source == "offline" and sources_parsed is not None:
+        print("Erro: --sources nao combina com --source offline.", file=sys.stderr)
+        return 2
+
+    if args.source not in ("offline", "all") and (
+        sources_parsed is not None or args.search_speed is not None
+    ):
+        print(
+            "Erro: --sources e --search-speed exigem --source all (fonte unica legacy e incompativel).",
+            file=sys.stderr,
+        )
+        return 2
+
+    if args.fast:
+        args.effective_sleep = 0.0
+        args.effective_max_pdf_pages = max(0, min(args.max_pdf_pages, 1))
+        args.effective_force_remote = args.force_remote
+        args.skip_author_enrich = True
+    elif args.thorough:
+        args.effective_sleep = max(args.sleep, 0.35)
+        args.effective_max_pdf_pages = min(max(args.max_pdf_pages, 5), 15)
+        args.effective_force_remote = True
+        args.skip_author_enrich = False
+    elif args.search_speed is not None:
+        spd = args.search_speed
+        if spd == 5:
+            args.effective_sleep = 0.0
+            args.effective_max_pdf_pages = max(0, min(args.max_pdf_pages, 1))
+            args.effective_force_remote = args.force_remote
+            args.skip_author_enrich = True
+        elif spd == 4:
+            args.effective_sleep = max(args.sleep, 0.08)
+            args.effective_max_pdf_pages = max(0, min(args.max_pdf_pages, 2))
+            args.effective_force_remote = args.force_remote
+            args.skip_author_enrich = True
+        elif spd == 3:
+            args.effective_sleep = max(args.sleep, 0.15)
+            args.effective_max_pdf_pages = max(0, min(args.max_pdf_pages, 3))
+            args.effective_force_remote = args.force_remote
+            args.skip_author_enrich = True
+        elif spd == 2:
+            args.effective_sleep = max(args.sleep, 0.22)
+            args.effective_max_pdf_pages = args.max_pdf_pages
+            args.effective_force_remote = args.force_remote
+            args.skip_author_enrich = False
+        else:
+            args.effective_sleep = max(args.sleep, 0.35)
+            args.effective_max_pdf_pages = min(max(args.max_pdf_pages, 5), 15)
+            args.effective_force_remote = True
+            args.skip_author_enrich = False
+    else:
+        args.effective_sleep = args.sleep
+        args.effective_max_pdf_pages = args.max_pdf_pages
+        args.effective_force_remote = args.force_remote
+        args.skip_author_enrich = False
+
+    if args.source == "offline":
+        args.enabled_remote_sources = frozenset()
+    elif sources_parsed is not None:
+        args.enabled_remote_sources = sources_parsed
+    elif args.fast:
+        args.enabled_remote_sources = SEARCH_SPEED_TO_SOURCES[5]
+    elif args.thorough:
+        args.enabled_remote_sources = ALL_REMOTE_SOURCES
+    elif args.search_speed is not None:
+        args.enabled_remote_sources = SEARCH_SPEED_TO_SOURCES[args.search_speed]
+    elif args.source == "all":
+        args.enabled_remote_sources = ALL_REMOTE_SOURCES
+    else:
+        leg = args.source.lower()
+        if leg in ("googlebooks", "google"):
+            leg = "google"
+        args.enabled_remote_sources = frozenset({leg})
+
+    if compact_spaces(args.exts):
+        try:
+            args.ext_filter = parse_exts_csv(args.exts)
+        except ValueError as e:
+            print(f"Erro em --exts: {e}", file=sys.stderr)
+            return 2
+    else:
+        args.ext_filter = None
+
     roots = [Path(f).expanduser().resolve() for f in args.folders]
     for folder in roots:
         if not folder.exists() or not folder.is_dir():
@@ -1649,7 +2120,7 @@ def main() -> int:
         if args.source == "offline" and total_missing > 0:
             print(
                 "Dica: use --source all para tentar completar anos (Open Library, Google Books, "
-                "Wikipedia e fallback web)."
+                "Skoob, catalogs agregados, Wikipedia e fallback web)."
             )
 
     return 0
