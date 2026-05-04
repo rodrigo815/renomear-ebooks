@@ -15,7 +15,7 @@ import tempfile
 import time
 import urllib.parse
 import zipfile
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -95,6 +95,66 @@ _WINDOWS_RESERVED_NAMES = frozenset({
 
 SUPPORTED_EXTS = frozenset({".epub", ".pdf", ".mobi", ".azw", ".azw3", ".djvu"})
 
+_LOG_MESES_PT = (
+    "jan",
+    "fev",
+    "mar",
+    "abr",
+    "mai",
+    "jun",
+    "jul",
+    "ago",
+    "set",
+    "out",
+    "nov",
+    "dez",
+)
+_LOG_STRICT: dict[str, bool] = {"omit_console": False}
+
+
+def log_set_omit_console(value: bool) -> None:
+    _LOG_STRICT["omit_console"] = bool(value)
+
+
+def _log_timestamp() -> str:
+    now = datetime.now()
+    ms = now.microsecond // 1000
+    return (
+        f"{now.day:02d} {_LOG_MESES_PT[now.month - 1]} {now.year} "
+        f"{now.hour:02d}:{now.minute:02d}:{now.second:02d}.{ms:03d}"
+    )
+
+
+def _print_console(stream, line: str) -> None:
+    try:
+        print(line, file=stream, flush=True)
+    except UnicodeEncodeError:
+        enc = getattr(stream, "encoding", None) or "utf-8"
+        safe = line.encode(enc, errors="replace").decode(enc, errors="replace")
+        print(safe, file=stream, flush=True)
+
+
+def _log_emit(level: str, msg: str, stream) -> None:
+    if _LOG_STRICT["omit_console"] and level != "FATAL":
+        return
+    _print_console(stream, f"{_log_timestamp()} [{level}] {msg}")
+
+
+def log_info(msg: str) -> None:
+    _log_emit("INFO", msg, sys.stdout)
+
+
+def log_warn(msg: str) -> None:
+    _log_emit("WARN", msg, sys.stderr)
+
+
+def log_error(msg: str) -> None:
+    _log_emit("ERROR", msg, sys.stderr)
+
+
+def log_fatal(msg: str) -> None:
+    _log_emit("FATAL", msg, sys.stderr)
+
 
 def parse_exts_csv(raw: str) -> frozenset[str]:
     """Lista separada por virgula: aceita com ou sem ponto; normaliza para minusculas com ponto."""
@@ -110,10 +170,7 @@ def parse_exts_csv(raw: str) -> frozenset[str]:
     unknown = out - SUPPORTED_EXTS
     if unknown:
         unk = ", ".join(sorted(unknown))
-        print(
-            f"Aviso: extensoes ignoradas (nao suportadas): {unk}",
-            file=sys.stderr,
-        )
+        log_warn(f"Extensoes ignoradas (nao suportadas): {unk}")
     allowed = frozenset(out & SUPPORTED_EXTS)
     if not allowed:
         raise ValueError(
@@ -167,6 +224,8 @@ class BookMeta:
     notes: str = ""
     match_score: int = 0
     evidence: dict[str, str] = field(default_factory=dict)
+    # Sufixo de volume/edição extraído do nome (ex.: "Vol.1 3ªed") — sempre no fim do stem.
+    filename_extra_suffix: str = ""
 
     def __post_init__(self) -> None:
         if self.authors is None:
@@ -216,6 +275,8 @@ def author_looks_bad(author: str) -> bool:
     a = compact_spaces(author)
     if not a:
         return True
+    if _looks_like_volume_edition_credits(a):
+        return True
     n = normalize_for_match(a)
     words = set(n.split())
     if words & BAD_AUTHOR_WORDS:
@@ -240,6 +301,37 @@ def title_looks_bad(title: str) -> bool:
     if re.search(r"\.(pdf|docx?|txt|rtf)\b", t, re.I):
         return True
     return False
+
+
+def _looks_like_internal_id_title(s: str) -> bool:
+    """Titulo que parece UUID, hash MD5/SHA hex, ou slug interno (ex.: metadado EPUB corrupto)."""
+    t = compact_spaces(s)
+    if not t or len(t) < 12:
+        return False
+    tl = re.sub(r"[\s\-_]", "", t.lower())
+    if re.fullmatch(r"[0-9a-f]{24,}", tl):
+        return True
+    if re.fullmatch(
+        r"[0-9a-f]{8}[0-9a-f]{4}[0-9a-f]{4}[0-9a-f]{4}[0-9a-f]{12}",
+        tl,
+    ):
+        return True
+    if re.fullmatch(
+        r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}",
+        t.lower(),
+    ):
+        return True
+    alnum = re.sub(r"[^0-9a-f]", "", tl)
+    if len(alnum) >= 18 and len(tl) >= 18 and len(alnum) / len(tl) >= 0.82:
+        if not re.search(r"[a-zà-ÿ]{4,}", t.lower()):
+            return True
+    return False
+
+
+def _normalize_filename_hyphens(s: str) -> str:
+    """Travessao/en-dash (U+2013) e similares -> hifen ASCII para o parse AUTOR - TITULO."""
+    s = compact_spaces(s)
+    return compact_spaces(re.sub(r"[\u2013\u2014\u2212\u2010\u2011]", "-", s))
 
 
 def authors_list_looks_bad(authors: list[str] | None) -> bool:
@@ -636,11 +728,217 @@ def find_isbn(text: str) -> str:
     return ""
 
 
+def _looks_like_volume_edition_credits(s: str) -> bool:
+    """Conteúdo típico de (Vol... / ...ed.) — não é lista de autores."""
+    t = compact_spaces(s)
+    if not t or len(t) > 140:
+        return False
+    if len(t.split()) > 14:
+        return False
+    sl = t.lower()
+    if re.fullmatch(r"[12][0-9]{3}", sl.strip("()")):
+        return False
+    if re.search(r"\b(?:vol\.?|volume)\s*\d", sl, re.I):
+        return True
+    if re.search(r"\bv\.\s*\d", sl, re.I):
+        return True
+    if re.search(r"\b(?:tomo|tom)\s*\d", sl, re.I):
+        return True
+    if re.search(r"\b(?:t\.)\s*\d", sl, re.I):
+        return True
+    if re.search(
+        r"\d{1,2}\s*[ªºa]\s*\.?\s*(?:ed\.?|edi[cç][aã]o|edicao|edition)\b",
+        sl,
+        re.I,
+    ):
+        return True
+    if re.search(r"\b(?:ed\.?|edi[cç][aã]o|edicao|edition)\s*\d", sl, re.I):
+        return True
+    if re.search(r"\d\s*[aª]\.?\s*ed\b", sl, re.I):
+        return True
+    if re.search(r"\b(?:revis|rev\.|atualizad)\w*", sl, re.I) and re.search(
+        r"\bed\b", sl, re.I
+    ):
+        return True
+    return False
+
+
+def strip_trailing_volume_edition_parenthetical(stem: str) -> tuple[str, str]:
+    """Remove um ou mais sufixos finais (...vol/ed...) e devolve texto base + sufixo plano."""
+    s = compact_spaces(stem)
+    bits: list[str] = []
+    tail_re = re.compile(r"^(.+?)\s*\(([^()]{1,160})\)\s*$")
+    while True:
+        m = tail_re.match(s)
+        if not m:
+            break
+        inner = compact_spaces(m.group(2))
+        if not _looks_like_volume_edition_credits(inner):
+            break
+        bits.insert(0, inner)
+        s = compact_spaces(m.group(1))
+    suffix = compact_spaces(" ".join(bits))
+    return s, suffix
+
+
+def normalize_volume_edition_suffix(s: str) -> str:
+    """Normaliza abreviaturas de edição (ex.: 3a.ed -> 3ªed)."""
+    t = compact_spaces(s)
+    if not t:
+        return ""
+    t = re.sub(
+        r"(\d)\s*([aA])(?:\.|\s)+ed\b",
+        r"\1ªed",
+        t,
+        flags=re.I,
+    )
+    return compact_spaces(t)
+
+
+def _segment_author_likelihood(seg: str) -> float:
+    """Heuristica 0-1: o segmento parece bloco de autor(es)?"""
+    t = compact_spaces(seg)
+    if not t:
+        return 0.0
+    wc = len(t.split())
+    score = 0.04
+    if 1 <= wc <= 10:
+        score += 0.14
+    if 2 <= wc <= 6:
+        score += 0.18
+    if re.search(r"\s([&]|\+)\s|\band\b|\be\b\s", t, re.I):
+        score += 0.34
+    if "," in t:
+        score += 0.18
+    parts_sa = split_authors(t)
+    if len(parts_sa) >= 2:
+        score += 0.26
+    elif len(parts_sa) == 1 and 2 <= wc <= 5:
+        score += 0.1
+    n = normalize_for_match(t)
+    nwords = set(n.split())
+    nh = len(nwords & STOP_TITLE_WORDS)
+    if nh:
+        score -= min(0.28, 0.07 * nh)
+    if _looks_like_volume_edition_credits(t):
+        score -= 0.55
+    if _looks_like_internal_id_title(t):
+        score -= 0.5
+    if wc > 14:
+        score -= 0.38
+    elif wc > 10:
+        score -= 0.12
+    return max(0.0, min(1.0, score))
+
+
+def _segment_title_likelihood(seg: str) -> float:
+    """Heuristica 0-1: o segmento parece titulo de obra?"""
+    t = compact_spaces(seg)
+    if not t:
+        return 0.0
+    wc = len(t.split())
+    score = 0.08
+    if wc >= 5:
+        score += 0.22
+    elif wc >= 3:
+        score += 0.12
+    n = normalize_for_match(t)
+    nwords = set(n.split())
+    if nwords & STOP_TITLE_WORDS:
+        score += 0.08 * min(3, len(nwords & STOP_TITLE_WORDS))
+    if re.search(r"\b(de|do|da|dos|das|the|of|un|une|des|les)\b", t, re.I):
+        score += 0.14
+    if wc <= 2 and "," not in t:
+        score -= 0.15
+    if _looks_like_internal_id_title(t):
+        score -= 0.55
+    if _looks_like_volume_edition_credits(t):
+        score -= 0.2
+    return max(0.0, min(1.0, score))
+
+
+def _resolve_two_segments_to_authors_and_title(left: str, right: str) -> tuple[list[str], str]:
+    """Decide se left ou right e o lado dos autores (titulo pode ser o outro)."""
+    left, right = compact_spaces(left), compact_spaces(right)
+    if not left or not right:
+        return [], compact_spaces(f"{left} {right}".strip())
+
+    la, ra = _segment_author_likelihood(left), _segment_author_likelihood(right)
+    lt, rt = _segment_title_likelihood(left), _segment_title_likelihood(right)
+
+    left_is_author = la + rt * 0.55
+    right_is_author = ra + lt * 0.55
+
+    margin = 0.06
+
+    if left_is_author >= right_is_author + margin:
+        aul = split_authors(left)
+        if aul or la >= 0.2:
+            return aul if aul else split_authors(left), right
+    if right_is_author >= left_is_author + margin:
+        aur = split_authors(right)
+        if aur or ra >= 0.2:
+            return aur if aur else split_authors(right), left
+
+    lw, rw = len(left.split()), len(right.split())
+    if lw <= 6 and lw <= rw and re.search(r"[A-Za-zÀ-ÿ]", left):
+        return split_authors(left), right
+    if rw <= 6 and rw < lw and re.search(r"[A-Za-zÀ-ÿ]", right):
+        return split_authors(right), left
+    if lw <= 6 and re.search(r"[A-Za-zÀ-ÿ]", left):
+        return split_authors(left), right
+    if rw <= 6 and re.search(r"[A-Za-zÀ-ÿ]", right):
+        return split_authors(right), left
+
+    return [], clean_title(compact_spaces(f"{left} - {right}"))
+
+
+def _normalize_underscore_separators(s: str) -> str:
+    """Trata _, __ e ' _ ' como separador semelhante ao hifen com espacos."""
+    s2 = compact_spaces(s)
+    s2 = re.sub(r"\s+_{2,}\s+", " - ", s2)
+    s2 = re.sub(r"_{2,}", " - ", s2)
+    if s2.count("_") == 1:
+        s2 = s2.replace("_", " - ")
+    else:
+        s2 = re.sub(r"(?<=\S)_(?=\S)", " ", s2)
+    return compact_spaces(re.sub(r"(?:\s*-\s*){2,}", " - ", s2))
+
+
+def _expand_filename_separators_for_bipartite(stem: str) -> str:
+    """Prepara stem: hifens unicode + underscores candidatos a separador Autor/Titulo."""
+    s = _normalize_filename_hyphens(compact_spaces(stem))
+    s = _normalize_underscore_separators(s)
+    return compact_spaces(s)
+
+
+def _bipartite_split_once(stem: str) -> tuple[str, str] | None:
+    """Obtem dois segmentos (antes/depois do primeiro separador forte) ou None."""
+    raw = _expand_filename_separators_for_bipartite(stem)
+    parts = re.split(r"\s+-\s+", raw, maxsplit=1)
+    if len(parts) == 2 and parts[0] and parts[1]:
+        return parts[0], parts[1]
+    cands = list(re.finditer(r"(?<=[A-Za-zÀ-ÿ0-9])-(?=[A-Za-zÀ-ÿ0-9])", raw))
+    if len(cands) == 1:
+        m = cands[0]
+        L, R = compact_spaces(raw[: m.start()]), compact_spaces(raw[m.end() :])
+        if len(L) >= 3 and len(R) >= 4:
+            return L, R
+    return None
+
+
 def parse_filename_fallback(path: Path) -> BookMeta:
-    stem = compact_spaces(path.stem)
-    year = year_from_string(stem)
+    stem_raw = compact_spaces(path.stem)
+    stem_hyp = _normalize_filename_hyphens(stem_raw)
+    stem, file_suffix = strip_trailing_volume_edition_parenthetical(stem_hyp)
+    year = year_from_string(stem) or year_from_string(stem_hyp) or year_from_string(stem_raw)
     title = stem
     authors: list[str] = []
+
+    def _finish(meta: BookMeta) -> BookMeta:
+        if file_suffix:
+            meta.filename_extra_suffix = normalize_volume_edition_suffix(file_suffix)
+        return meta
 
     m = re.match(
         r"^(.+?)\s+-\s+((?:1[4-9]\d{2}|20\d{2}|s\.d\.))\s+-\s+(.+)$",
@@ -652,7 +950,9 @@ def parse_filename_fallback(path: Path) -> BookMeta:
         authors = split_authors(m.group(1))
         year = "" if m.group(2).lower() == "s.d." else m.group(2)
         title = m.group(3)
-        return BookMeta(str(path), clean_title(title), authors, year, source="filename", confidence=0.35)
+        return _finish(
+            BookMeta(str(path), clean_title(title), authors, year, source="filename", confidence=0.35)
+        )
 
     m = re.match(r"^((?:1[4-9]\d{2}|20\d{2}))\s+-\s+(.+?)\s+-\s+(.+)$", stem)
 
@@ -660,27 +960,65 @@ def parse_filename_fallback(path: Path) -> BookMeta:
         year = m.group(1)
         authors = split_authors(m.group(2))
         title = m.group(3)
-        return BookMeta(str(path), clean_title(title), authors, year, source="filename", confidence=0.35)
+        return _finish(
+            BookMeta(str(path), clean_title(title), authors, year, source="filename", confidence=0.35)
+        )
 
     m = re.match(r"^(.+?)\s*\(([^()]+)\)$", stem)
 
     if m:
         title = m.group(1)
         authors = split_authors(m.group(2))
-        return BookMeta(str(path), clean_title(title), authors, year, source="filename", confidence=0.25)
+        return _finish(
+            BookMeta(str(path), clean_title(title), authors, year, source="filename", confidence=0.25)
+        )
 
-    parts = re.split(r"\s+-\s+", stem, maxsplit=1)
-
-    if len(parts) == 2:
-        left, right = parts
-
-        if re.search(r"[A-Za-zÀ-ÿ]", left) and len(left.split()) <= 6:
-            authors = split_authors(left)
-            title = right
+    conf_fb = 0.15
+    pair = _bipartite_split_once(stem)
+    if pair:
+        left, right = pair
+        if re.search(r"[A-Za-zÀ-ÿ]", left + right):
+            authors, title = _resolve_two_segments_to_authors_and_title(left, right)
+            if authors:
+                conf_fb = 0.2
 
     title = re.sub(r"\b(1[4-9]\d{2}|20\d{2})\b", " ", title)
 
-    return BookMeta(str(path), clean_title(title), authors, year, source="filename", confidence=0.15)
+    return _finish(
+        BookMeta(str(path), clean_title(title), authors, year, source="filename", confidence=conf_fb)
+    )
+
+
+def filename_triplet_structured_stem(path: Path) -> bool:
+    """True se o stem segue AUTOR - ANO|s.d. - TITULO ou ANO - AUTOR - TITULO (mesmas duas regex de parse_filename_fallback)."""
+    stem = _normalize_filename_hyphens(compact_spaces(path.stem))
+    if re.match(
+        r"^(.+?)\s+-\s+((?:1[4-9]\d{2}|20\d{2}|s\.d\.))\s+-\s+(.+)$",
+        stem,
+        re.I,
+    ):
+        return True
+    return bool(
+        re.match(r"^((?:1[4-9]\d{2}|20\d{2}))\s+-\s+(.+?)\s+-\s+(.+)$", stem)
+    )
+
+
+def prioritize_triplet_filename_over_local(local: BookMeta, path: Path) -> BookMeta:
+    """Quando o nome do ficheiro ja traz autor, ano (ou s.d.) e titulo em triplete, prioriza esse parse sobre EPUB/outros."""
+    if not filename_triplet_structured_stem(path):
+        return local
+    fb = parse_filename_fallback(path)
+    if fb.confidence < 0.35:
+        return local
+    out = replace(
+        local,
+        title=fb.title or local.title,
+        authors=list(fb.authors) if fb.authors else list(local.authors or []),
+        year=fb.year or local.year,
+        confidence=max(local.confidence, fb.confidence),
+    )
+    append_note(out, "nome em AUTOR-ANO-TITULO: sem busca remota")
+    return out
 
 
 _EPUB_MAX_XML_BYTES = 8 * 1024 * 1024  # 8 MiB para metadados (container/OPF)
@@ -905,7 +1243,52 @@ def read_local_metadata(path: Path, max_pdf_pages: int, year_strategy: str = "or
     if fallback.notes and not meta.notes:
         meta.notes = fallback.notes
 
+    if path.suffix.lower() in {".epub", ".mobi", ".azw", ".azw3"}:
+        if _looks_like_internal_id_title(meta.title or "") and compact_spaces(fallback.title or ""):
+            meta.title = fallback.title
+            append_note(meta, "titulo do ficheiro substitui id/slug no metadado embeddado")
+        if authors_list_looks_bad(meta.authors) and fallback.authors and not authors_list_looks_bad(
+            fallback.authors
+        ):
+            meta.authors = list(fallback.authors)
+            append_note(meta, "autores do ficheiro substituem metadado embeddado duvidoso")
+
+    sfx = compact_spaces(getattr(fallback, "filename_extra_suffix", ""))
+    if sfx:
+        meta.filename_extra_suffix = sfx
+
     return meta
+
+
+def patch_meta_from_filename_if_merged_suspect(path: Path, meta: BookMeta) -> BookMeta:
+    """Evita renomear para titulo hash / UNKNOWN / autor remoto absurdo quando o nome do ficheiro e claro."""
+    fb = parse_filename_fallback(path)
+    out = meta
+
+    if (
+        _looks_like_internal_id_title(compact_spaces(out.title or ""))
+        and compact_spaces(fb.title or "")
+        and not _looks_like_internal_id_title(fb.title)
+    ):
+        out = replace(out, title=fb.title)
+        append_note(out, "failsafe: titulo restaurado a partir do nome do ficheiro")
+
+    if authors_list_looks_bad(out.authors) and fb.authors and not authors_list_looks_bad(fb.authors):
+        out = replace(out, authors=list(fb.authors))
+        append_note(out, "failsafe: autores restaurados a partir do nome do ficheiro")
+    elif (
+        fb.authors
+        and not authors_list_looks_bad(fb.authors)
+        and out.authors
+        and not authors_list_looks_bad(out.authors)
+    ):
+        nfb = normalize_for_match(" ".join(fb.authors))
+        nmo = normalize_for_match(" ".join(out.authors))
+        if nfb and nmo and fuzz.token_set_ratio(nfb, nmo) < 42:
+            out = replace(out, authors=list(fb.authors))
+            append_note(out, "failsafe: autores do ficheiro preferidos (forte discordancia com remoto)")
+
+    return out
 
 
 def cache_key(url: str, params: dict[str, Any] | None) -> str:
@@ -1036,7 +1419,8 @@ def best_openlibrary(
 
             score = 0.78 * t_score + 0.22 * a_score
 
-            if t_score >= 60 and (not target_author or a_score >= 36):
+            min_title = 72 if not target_author else 60
+            if t_score >= min_title and (not target_author or a_score >= 36):
                 if best is None or score > best[0]:
                     best = (score, doc)
 
@@ -1120,7 +1504,8 @@ def best_googlebooks(meta: BookMeta, cache: dict[str, Any], sleep_s: float) -> B
 
             score = 0.78 * t_score + 0.22 * a_score
 
-            if t_score >= 58 and (not target_author or a_score >= 34):
+            min_title = 70 if not target_author else 58
+            if t_score >= min_title and (not target_author or a_score >= 34):
                 if best is None or score > best[0]:
                     best = (score, info)
 
@@ -1530,6 +1915,13 @@ def merge_metadata(
 
     out.notes = " | ".join(notes)
 
+    sfx = compact_spaces(
+        getattr(local, "filename_extra_suffix", "")
+        or getattr(remote, "filename_extra_suffix", "")
+    )
+    if sfx:
+        out.filename_extra_suffix = sfx
+
     return out
 
 
@@ -1792,7 +2184,26 @@ def default_filename_stem(
     else:
         base = title
 
-    return safe_filename_part(base, max_len=190)
+    base = safe_filename_part(base, max_len=190)
+    extra = compact_spaces(getattr(meta, "filename_extra_suffix", "") or "")
+    if extra:
+        ex = safe_filename_part(normalize_volume_edition_suffix(extra), max_len=72)
+        if ex:
+            base = safe_filename_part(f"{base} - {ex}", max_len=220)
+    return base
+
+
+def _append_filename_extra_suffix_to_fullname(full_name: str, extra: str) -> str:
+    """Com --filename-pattern: acrescenta sufixo vol./ed. antes da extensao."""
+    ex = compact_spaces(normalize_volume_edition_suffix(extra or ""))
+    if not ex:
+        return full_name
+    exs = safe_filename_part(ex, max_len=72)
+    if not exs:
+        return full_name
+    p = Path(full_name)
+    new_stem = safe_filename_part(f"{p.stem} - {exs}", max_len=200)
+    return new_stem + p.suffix.lower()
 
 
 def make_new_filename(
@@ -1861,7 +2272,7 @@ def make_new_filename(
     if not has_format:
         stem = stem + ext_l
 
-    return stem
+    return _append_filename_extra_suffix_to_fullname(stem, meta.filename_extra_suffix or "")
 
 
 def unique_target(src: Path, filename: str, target_dir: Path, reserved: set[Path]) -> Path:
@@ -2074,7 +2485,7 @@ def run_dedup_hashes(folder: Path, args: argparse.Namespace) -> Path:
                 try:
                     dig = _file_hash_digest(path, algo)
                 except OSError as e:
-                    print(f"Aviso: nao foi possivel ler {path}: {e}", file=sys.stderr)
+                    log_warn(f"Nao foi possivel ler {path}: {e}")
                     continue
                 buckets[dig].append(path)
         else:
@@ -2085,7 +2496,7 @@ def run_dedup_hashes(folder: Path, args: argparse.Namespace) -> Path:
                     try:
                         dig = fut.result()
                     except OSError as e:
-                        print(f"Aviso: nao foi possivel ler {p}: {e}", file=sys.stderr)
+                        log_warn(f"Nao foi possivel ler {p}: {e}")
                         continue
                     buckets[dig].append(p)
 
@@ -2141,7 +2552,7 @@ def run_dedup_hashes(folder: Path, args: argparse.Namespace) -> Path:
                 try:
                     p.rename(dest)
                 except OSError as e:
-                    print(f"Erro ao mover duplicado {p}: {e}", file=sys.stderr)
+                    log_error(f"Erro ao mover duplicado {p}: {e}")
 
     fields = [
         "grupo",
@@ -2162,11 +2573,11 @@ def run_dedup_hashes(folder: Path, args: argparse.Namespace) -> Path:
             w.writerow(_csv_safe_row(row))
 
     if clusters:
-        print(f"Duplicados por hash ({algo}): {report_path} ({len(rows)} linhas).")
+        log_info(f"Duplicados por hash ({algo}): {report_path} ({len(rows)} linhas).")
     else:
-        print(f"Nenhum grupo com hash identico. CSV vazio (cabecalho): {report_path}")
+        log_info(f"Nenhum grupo com hash identico. CSV vazio (cabecalho): {report_path}")
     if args.delete_dups and clusters:
-        print(f"Duplicados movidos para: {_resolved_path(dup_dir)}")
+        log_info(f"Duplicados movidos para: {_resolved_path(dup_dir)}")
     return report_path
 
 
@@ -2418,6 +2829,10 @@ def merge_supplementary_override(base: BookMeta, sup: BookMeta) -> BookMeta:
             subs.append(c)
     subs = subs[:40]
 
+    sfx = compact_spaces(
+        getattr(sup, "filename_extra_suffix", "") or getattr(base, "filename_extra_suffix", "")
+    )
+
     return BookMeta(
         path=base.path,
         title=compact_spaces(sup.title) or base.title,
@@ -2434,6 +2849,7 @@ def merge_supplementary_override(base: BookMeta, sup: BookMeta) -> BookMeta:
         ),
         confidence=max(base.confidence, sup.confidence or 1.0),
         notes=" | ".join(x for x in (base.notes, sup.notes) if compact_spaces(x)),
+        filename_extra_suffix=sfx,
     )
 
 
@@ -2478,19 +2894,18 @@ def load_supplementary_data(
                 if bm:
                     items.append(bm)
         else:
-            print(
-                f"Aviso: --supplementary-data suporta .json, .csv ou .txt (recebido: {ext or '(sem)'}).",
-                file=sys.stderr,
+            log_warn(
+                f"--supplementary-data suporta .json, .csv ou .txt (recebido: {ext or '(sem)'})."
             )
             return None
     except OSError as e:
-        print(f"Erro ao ler ficheiro suplementar {path}: {e}", file=sys.stderr)
+        log_error(f"Erro ao ler ficheiro suplementar {path}: {e}")
         return None
     except json.JSONDecodeError as e:
-        print(f"JSON invalido em {path}: {e}", file=sys.stderr)
+        log_error(f"JSON invalido em {path}: {e}")
         return None
     if not items:
-        print(f"Aviso: nenhum registo util em {path}", file=sys.stderr)
+        log_warn(f"Nenhum registo util em {path}")
         return None
     return SupplementaryIndex(items, label, base_folder)
 
@@ -2552,12 +2967,12 @@ def interactive_review_item(
     args: argparse.Namespace,
 ) -> tuple[str, Path, str]:
     """Devolve (novo_nome, alvo, escolha) com escolha em accept|edit|skip|always_author."""
-    print("\n--- Revisao ---")
-    print(f"Original:\n  {path.name}\n")
-    print(f"Sugestao:\n  {proposed_name}\n")
-    print(f"Pontuacao: {meta.match_score}%")
+    log_info("\n--- Revisao ---")
+    log_info(f"Original:\n  {path.name}\n")
+    log_info(f"Sugestao:\n  {proposed_name}\n")
+    log_info(f"Pontuacao: {meta.match_score}%")
     band = _review_band(meta.match_score)
-    print(
+    log_info(
         "Faixa: "
         + (
             "automatico (>=90%)"
@@ -2565,12 +2980,12 @@ def interactive_review_item(
             else "revisar (70-89%)" if band == "review" else "duvidoso (<70%)"
         )
     )
-    print(f"Confianca (metadado): {round(100 * meta.confidence)}%")
-    print(f"Fonte: {meta.source or '(local)'}\n")
+    log_info(f"Confianca (metadado): {round(100 * meta.confidence)}%")
+    log_info(f"Fonte: {meta.source or '(local)'}\n")
     if meta.evidence:
-        print("Evidencias:")
+        log_info("Evidencias:")
         for k, v in sorted(meta.evidence.items()):
-            print(f"  - {k}: {v}")
+            log_info(f"  - {k}: {v}")
     suf = path.suffix.lower()
     while True:
         try:
@@ -2586,7 +3001,9 @@ def interactive_review_item(
         if ch == "P":
             return path.name, path.resolve(), "skip"
         if ch == "E":
-            print("Novo nome de ficheiro (com ou sem extensao; se omitir extensao, mantem-se a actual).")
+            log_info(
+                "Novo nome de ficheiro (com ou sem extensao; se omitir extensao, mantem-se a actual)."
+            )
             try:
                 ed = input("> ").strip()
             except EOFError:
@@ -2608,7 +3025,7 @@ def interactive_review_item(
                 )
             tgt = unique_target(path, proposed_name, output_dir, reserved)
             return proposed_name, tgt, "always_author"
-        print("Opcao invalida (use A, E, P ou S).")
+        log_warn("Opcao invalida (use A, E, P ou S).")
 
 
 def run_on_root(
@@ -2636,10 +3053,7 @@ def run_on_root(
         if sp:
             sup_index = load_supplementary_data(sp, folder)
         else:
-            print(
-                f"Aviso: ficheiro --supplementary-data nao encontrado: {args.supplementary_data}",
-                file=sys.stderr,
-            )
+            log_warn(f"Ficheiro --supplementary-data nao encontrado: {args.supplementary_data}")
 
     exclude_dir = output_dir if output_dir != folder else None
     files = iter_files(
@@ -2668,9 +3082,14 @@ def run_on_root(
     catalog_entries: list[dict[str, Any]] = []
 
     for path, local in local_pairs:
+        local = prioritize_triplet_filename_over_local(local, path)
+        skip_remote_triplet = (
+            filename_triplet_structured_stem(path) and not args.effective_force_remote
+        )
         should_use_offline = (
             args.source == "offline"
             or (local.year and not args.effective_force_remote)
+            or skip_remote_triplet
         )
         if should_use_offline:
             meta = local
@@ -2687,6 +3106,7 @@ def run_on_root(
                 keep_local_metadata=args.keep_local_metadata_fields,
             )
         meta = apply_supplementary_merged(local, meta, sup_index, args)
+        meta = patch_meta_from_filename_if_merged_suspect(path, meta)
         ms, evd = compute_match_evidence(local, meta)
         if sup_index and "supplement" in (meta.source or "").lower():
             evd["suplemento"] = f"ficheiro: {Path(sup_index.label).name}"
@@ -2781,11 +3201,7 @@ def run_on_root(
 
         line = f"{status}: {path.name} -> {Path(target).name}"
         if not args.quiet:
-            try:
-                print(line)
-            except UnicodeEncodeError:
-                safe_line = line.encode("cp1252", errors="replace").decode("cp1252", errors="replace")
-                print(safe_line)
+            log_info(line)
 
         if getattr(args, "review", False) and band != "auto":
             review_needed_rows.append(
@@ -2899,7 +3315,7 @@ def run_on_root(
             getattr(args, "catalog_format", "json"),
         ):
             if not args.quiet:
-                print(f"Catalogo salvo em: {wp}")
+                log_info(f"Catalogo salvo em: {wp}")
 
     return len(rows), missing_year_count, plan_path, cache_path, missing_path, review_path_out
 
@@ -3061,7 +3477,9 @@ def run_find_duplicates(folder: Path, args: argparse.Namespace) -> Path | None:
 
     clusters = [frozenset(s) for s in comp.values() if len(s) >= 2]
     if not clusters:
-        print("Nenhum grupo de duplicados encontrado (ISBN, autor+titulo ou fingerprint+ tamanho).")
+        log_info(
+            "Nenhum grupo de duplicados encontrado (ISBN, autor+titulo ou fingerprint+ tamanho)."
+        )
         return None
 
     order = _parse_prefer_format_csv(args.prefer_format)
@@ -3115,7 +3533,7 @@ def run_find_duplicates(folder: Path, args: argparse.Namespace) -> Path | None:
                 try:
                     dup.rename(dest)
                 except OSError as e:
-                    print(f"Erro ao mover duplicado {dup}: {e}", file=sys.stderr)
+                    log_error(f"Erro ao mover duplicado {dup}: {e}")
 
     with report_path.open("w", encoding="utf-8-sig", newline="") as f:
         w = csv.DictWriter(f, fieldnames=["grupo", "manter", "duplicado", "acao"])
@@ -3123,9 +3541,9 @@ def run_find_duplicates(folder: Path, args: argparse.Namespace) -> Path | None:
         for row in rows:
             w.writerow(_csv_safe_row(row))
 
-    print(f"Relatorio de duplicados: {report_path} ({len(rows)} linhas).")
+    log_info(f"Relatorio de duplicados: {report_path} ({len(rows)} linhas).")
     if args.move_duplicates:
-        print(f"Arquivos movidos para: {_resolved_path(dup_dir)}")
+        log_info(f"Arquivos movidos para: {_resolved_path(dup_dir)}")
     return report_path
 
 
@@ -3147,6 +3565,8 @@ def main() -> int:
             "Exemplos:\n"
             "  Simulacao rapida (50 arquivos, sem rede extra se ja houver ano local):\n"
             "    python renomear_ebooks.py \"C:\\Livros\" --limit 50 --quiet\n\n"
+            "  Sem nenhuma mensagem no terminal (so CSV/cache; [FATAL] ainda aparece):\n"
+            "    python renomear_ebooks.py \"C:\\Livros\" --omit-console --quiet\n\n"
             "  Simulacao completa com busca de ano na rede:\n"
             "    python renomear_ebooks.py \"C:\\Livros\" --source all --sleep 0.25\n\n"
             "  Varias pastas (cada uma com seu proprio renamed/):\n"
@@ -3240,6 +3660,8 @@ def main() -> int:
             "bookbrowse, bookbrainz, amazon, isbndb), Wikipedia e busca web (fallback). "
             "Se o ano ja foi encontrado na leitura local, a rede e pulada salvo --force-remote "
             "(ou --fetch-remote-always). "
+            "Se o nome do ficheiro ja estiver em AUTOR - ANO - TITULO (ou ANO - AUTOR - TITULO, "
+            "incl. s.d. no lugar do ano), a rede e igualmente pulada salvo --force-remote. "
             "Combine com --sources ou --search-speed (exige --source all)."
         ),
     )
@@ -3455,15 +3877,24 @@ def main() -> int:
         dest="force_remote",
         help=(
             "Sempre executa a fase de busca remota (rede), mesmo quando a leitura local ja "
-            "trouxer ano ou outros dados uteis. Sem esta flag, se existir ano local a rede e "
-            "ignorada. Independente de --thorough / --search-speed. Apos a busca, "
-            "--remote-metadata e --keep-local-metadata controlam o merge no metadado final."
+            "trouxer ano ou outros dados uteis, ou quando o nome do ficheiro ja estiver em "
+            "AUTOR-ANO-TITULO (ou ANO-AUTOR-TITULO). Sem esta flag, com ano local ou nome "
+            "estruturado assim, a rede e ignorada. Independente de --thorough / --search-speed. "
+            "Apos a busca, --remote-metadata e --keep-local-metadata controlam o merge no metadado final."
         ),
     )
     ap.add_argument(
         "--quiet",
         action="store_true",
         help="Nao imprime linha a linha no console (o CSV e resumo final continuam).",
+    )
+    ap.add_argument(
+        "--omit-console",
+        action="store_true",
+        help=(
+            "Nao escreve mensagens no terminal ([INFO]/[WARN]/[ERROR]); CSVs, caches e ficheiros "
+            "gerados mantem-se. [FATAL] ainda e impresso. Incompativel com --review."
+        ),
     )
     ap.add_argument(
         "--generate-catalog",
@@ -3549,11 +3980,16 @@ def main() -> int:
     args = ap.parse_args()
     args.review_author_lock = {}
 
+    if args.omit_console and args.review:
+        log_error("--omit-console nao combina com --review (e preciso ver mensagens no terminal).")
+        return 2
+
+    log_set_omit_console(bool(args.omit_console))
+
     if not _HAS_DEFUSED_XML:
-        print(
-            "Aviso: defusedxml nao instalado; XML de EPUB e lido com xml.etree (limite de "
-            "tamanho aplicado). Instale 'defusedxml' para defesa adicional contra XML-bomb.",
-            file=sys.stderr,
+        log_warn(
+            "defusedxml nao instalado; XML de EPUB e lido com xml.etree (limite de "
+            "tamanho aplicado). Instale 'defusedxml' para defesa adicional contra XML-bomb."
         )
 
     try:
@@ -3563,19 +3999,18 @@ def main() -> int:
             else None
         )
     except ValueError as e:
-        print(f"Erro em --sources: {e}", file=sys.stderr)
+        log_error(f"Erro em --sources: {e}")
         return 2
 
     if args.source == "offline" and sources_parsed is not None:
-        print("Erro: --sources nao combina com --source offline.", file=sys.stderr)
+        log_error("--sources nao combina com --source offline.")
         return 2
 
     if args.source not in ("offline", "all") and (
         sources_parsed is not None or args.search_speed is not None
     ):
-        print(
-            "Erro: --sources e --search-speed exigem --source all (fonte unica legacy e incompativel).",
-            file=sys.stderr,
+        log_error(
+            "--sources e --search-speed exigem --source all (fonte unica legacy e incompativel)."
         )
         return 2
 
@@ -3586,7 +4021,7 @@ def main() -> int:
             else MERGE_METADATA_FIELDS
         )
     except ValueError as e:
-        print(f"Erro em --remote-metadata: {e}", file=sys.stderr)
+        log_error(f"Erro em --remote-metadata: {e}")
         return 2
 
     try:
@@ -3596,7 +4031,7 @@ def main() -> int:
             else frozenset()
         )
     except ValueError as e:
-        print(f"Erro em --keep-local-metadata: {e}", file=sys.stderr)
+        log_error(f"Erro em --keep-local-metadata: {e}")
         return 2
 
     args.unknown_year_text = compact_spaces(args.unknown_year_text or "")
@@ -3605,10 +4040,9 @@ def main() -> int:
 
     if args.omit_date_if_missing:
         if args.unknown_year == "sd":
-            print(
-                "Aviso: --omit-date-if-missing equivale a --unknown-year omit "
-                "(sem segmento de ano quando a data nao existir; com ano, o ano continua no nome).",
-                file=sys.stderr,
+            log_warn(
+                "--omit-date-if-missing equivale a --unknown-year omit "
+                "(sem segmento de ano quando a data nao existir; com ano, o ano continua no nome)."
             )
         args.unknown_year = "omit"
 
@@ -3677,7 +4111,7 @@ def main() -> int:
         try:
             args.ext_filter = parse_exts_csv(args.exts)
         except ValueError as e:
-            print(f"Erro em --exts: {e}", file=sys.stderr)
+            log_error(f"Erro em --exts: {e}")
             return 2
     else:
         args.ext_filter = None
@@ -3685,58 +4119,52 @@ def main() -> int:
     roots = [Path(f).expanduser().resolve() for f in args.folders]
     for folder in roots:
         if not folder.exists() or not folder.is_dir():
-            print(f"Pasta invalida: {folder}", file=sys.stderr)
+            log_error(f"Pasta invalida: {folder}")
             return 2
 
     if args.apply and args.review:
-        print("Erro: --apply e --review nao podem ser usados juntos.", file=sys.stderr)
+        log_error("--apply e --review nao podem ser usados juntos.")
         return 2
 
     if args.move_duplicates and not args.find_duplicates:
-        print("Erro: --move-duplicates exige --find-duplicates.", file=sys.stderr)
+        log_error("--move-duplicates exige --find-duplicates.")
         return 2
 
     if args.prefer_larger and args.prefer_smaller:
-        print("Erro: use apenas uma de --prefer-larger ou --prefer-smaller.", file=sys.stderr)
+        log_error("Use apenas uma de --prefer-larger ou --prefer-smaller.")
         return 2
 
     if args.delete_dups and not args.dedup:
-        print("Erro: --delete-dups exige --dedup.", file=sys.stderr)
+        log_error("--delete-dups exige --dedup.")
         return 2
 
     if args.dedup and args.find_duplicates:
-        print("Erro: --dedup e --find-duplicates sao mutuamente exclusivos.", file=sys.stderr)
+        log_error("--dedup e --find-duplicates sao mutuamente exclusivos.")
         return 2
 
     if args.generate_catalog and (args.find_duplicates or args.dedup):
-        print(
-            "Erro: --generate-catalog nao pode ser usado com --find-duplicates ou --dedup.",
-            file=sys.stderr,
-        )
+        log_error("--generate-catalog nao pode ser usado com --find-duplicates ou --dedup.")
         return 2
 
     if args.find_duplicates:
         if args.apply or args.review:
-            print(
-                "Erro: --find-duplicates nao combina com --apply nem com --review.",
-                file=sys.stderr,
-            )
+            log_error("--find-duplicates nao combina com --apply nem com --review.")
             return 2
         n_roots_dup = len(roots)
         for folder in roots:
             if n_roots_dup > 1 and not args.quiet:
-                print(f"\n--- duplicados: {folder} ---")
+                log_info(f"\n--- duplicados: {folder} ---")
             run_find_duplicates(folder, args)
         return 0
 
     if args.dedup:
         if args.apply or args.review:
-            print("Erro: --dedup nao combina com --apply nem com --review.", file=sys.stderr)
+            log_error("--dedup nao combina com --apply nem com --review.")
             return 2
         n_roots_ded = len(roots)
         for folder in roots:
             if n_roots_ded > 1 and not args.quiet:
-                print(f"\n--- dedup (hash): {folder} ---")
+                log_info(f"\n--- dedup (hash): {folder} ---")
             run_dedup_hashes(folder, args)
         return 0
 
@@ -3746,26 +4174,26 @@ def main() -> int:
 
     for folder in roots:
         if n_roots > 1 and not args.quiet:
-            print(f"\n--- {folder} ---")
+            log_info(f"\n--- {folder} ---")
         n_rows, miss, plan_path, cache_path, missing_path, review_path = run_on_root(folder, args)
         total_analysed += n_rows
         total_missing += miss
-        print(f"\nArquivos analisados (esta pasta): {n_rows}")
-        print(f"Sem ano identificado (esta pasta): {miss}")
-        print(f"Plano/log salvo em: {plan_path}")
-        print(f"Cache salvo em: {cache_path}")
+        log_info(f"\nArquivos analisados (esta pasta): {n_rows}")
+        log_info(f"Sem ano identificado (esta pasta): {miss}")
+        log_info(f"Plano/log salvo em: {plan_path}")
+        log_info(f"Cache salvo em: {cache_path}")
         if missing_path is not None:
-            print(f"Log de sem-data salvo em: {missing_path}")
+            log_info(f"Log de sem-data salvo em: {missing_path}")
         if review_path is not None:
-            print(f"Revisao sugerida (CSV): {review_path}")
+            log_info(f"Revisao sugerida (CSV): {review_path}")
 
     if n_roots > 1:
-        print(f"\nTotal em {n_roots} pastas: {total_analysed} arquivos, {total_missing} sem ano.")
+        log_info(f"\nTotal em {n_roots} pastas: {total_analysed} arquivos, {total_missing} sem ano.")
 
     if not args.apply:
-        print("Simulacao apenas. Para renomear de verdade, rode novamente com --apply.")
+        log_info("Simulacao apenas. Para renomear de verdade, rode novamente com --apply.")
         if args.source == "offline" and total_missing > 0:
-            print(
+            log_info(
                 "Dica: use --source all para tentar completar anos (Open Library, Google Books, "
                 "Skoob, catalogs agregados, Wikipedia e fallback web)."
             )
