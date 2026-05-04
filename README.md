@@ -4,7 +4,7 @@ Script em Python para **renomear e organizar e-books** no padrão:
 
 `SOBRENOME, Nome - Ano - Titulo.ext`
 
-Suporta **EPUB**, **PDF**, **MOBI**, **AZW**, **AZW3** e **DJVU**.  
+Suporta **EPUB**, **PDF**, **MOBI**, **AZW**, **AZW3** e **DJVU**.
 Os arquivos processados são **movidos/renomeados para a subpasta `renamed`** dentro da pasta que você passar como argumento (exceto se você já rodar apontando diretamente para uma pasta chamada `renamed`).
 
 Por padrão, em **cada** pasta raiz informada, só entram arquivos **no nível imediato** dessa pasta. Use **`--recursive`** para incluir também todas as subpastas.
@@ -26,7 +26,7 @@ São **mutuamente exclusivos**.
 | Flag | Efeito principal |
 |------|------------------|
 | **`--fast`** | Pausa HTTP ~**0 s**; no máximo **1** página de PDF por ficheiro; com `--source all` só **Open Library + Google Books** (sem Skoob, catalogs agregados, Wikipedia, fallback web nem enriquecimento extra de autores por snippet). |
-| **`--thorough`** | Pausa HTTP ≥ **0,35 s**; **5–15** páginas de PDF; **força** sempre metadado remoto (mesmo se já houver ano local); com `--source all` usa **todas** as fontes. |
+| **`--thorough`** | Pausa HTTP ≥ **0,35 s**; **5–15** páginas de PDF; com `--source all` usa **todas** as fontes. **Não** liga por si a ida à rede quando já há ano local — use **`--force-remote`** / **`--fetch-remote-always`**. |
 
 Exemplo:
 
@@ -52,7 +52,7 @@ Tem precedência sobre o subconjunto definido por **`--search-speed`** e sobre o
 
 | N | Fontes remotas (resumo) | Pausa / PDF / enriquecimento de autores |
 |---|-------------------------|----------------------------------------|
-| **1** | Todas (OL → … → web) | Pausa ≥ 0,35 s; ≥ 5 páginas PDF (até 15); força rede; enriquece autores por DDG se preciso |
+| **1** | Todas (OL → … → web) | Pausa ≥ 0,35 s; ≥ 5 páginas PDF (até 15); enriquece autores por DDG se preciso (não ativa `--force-remote`) |
 | **2** | Até Wikipedia (sem web) | Pausa ≥ 0,22 s; `--max-pdf-pages`; enriquece |
 | **3** | Até catalogs agregados | Pausa ≥ 0,15 s; até 3 páginas PDF; sem enriquecimento |
 | **4** | Até Skoob | Pausa ≥ 0,08 s; até 2 páginas PDF; sem enriquecimento |
@@ -114,7 +114,7 @@ Com **`--filename-pattern`** pode definir um modelo com marcadores (maiúsculas 
 | Marcador | Conteúdo |
 |----------|-----------|
 | **`%AUTHOR%`** | Autores formatados (com `et al.` se `--max-authors` limitar) |
-| **`%DATE%`** | Ano identificado; se faltar, `s.d.` com `--unknown-year sd`, ou vazio com `omit` |
+| **`%DATE%`** | Ano identificado; se faltar, usa **`--unknown-year-text`** com `--unknown-year sd`, ou vazio com `omit` |
 | **`%TITLE%`** | Título |
 | **`%PUBLISHER%`** | Editora (ex.: EPUB `dc:publisher`, Google Books quando existir; pode ficar vazio) |
 | **`%FORMAT%`** | Extensão **com** ponto (ex.: `.pdf`) |
@@ -190,7 +190,20 @@ Sem chaves de API: o script usa o **DuckDuckGo HTML** com filtros `site:` agrupa
 
 Comportamento de performance:
 
-- Se o **ano já foi encontrado na leitura local**, as fontes remotas são **puladas**, salvo se você usar **`--force-remote`**.
+- Se o **ano já foi encontrado na leitura local**, a fase de **busca na rede** é **omitida**, salvo **`--force-remote`** ou **`--fetch-remote-always`** (mesma opção, dois nomes).
+
+### O que fundir do remoto (`--remote-metadata` / `--keep-local-metadata`)
+
+Depois de uma busca remota bem-sucedida, o script combina metadado local + remoto:
+
+- **`--remote-metadata`** (lista CSV): campos que **podem** ser preenchidos ou sobrescritos a partir do remoto. Valores: `title`, `authors`, `year`, `isbn`, `publisher` (aliases: `date`, `ano`, `author`, `titulo`, `editora`, …). **Omitir a flag** = todos os campos podem receber dados remotos.
+- **`--keep-local-metadata`** (lista CSV): campos em que **manter o local** quando já existir valor; o remoto não substitui (se o local estiver vazio, usa-se o remoto).
+
+Exemplo: ir sempre à rede, mas no ficheiro só atualizar **ano** e **ISBN**, mantendo **autor** e **título** do ficheiro:
+
+```bash
+python renomear_ebooks.py "E:\Livros" --source all --force-remote --remote-metadata year,isbn --keep-local-metadata authors,title
+```
 
 Estratégia de escolha entre vários anos candidatos:
 
@@ -199,12 +212,14 @@ Estratégia de escolha entre vários anos candidatos:
 
 Quando o ano continua desconhecido:
 
-- **`--unknown-year sd`**: usa `s.d.` no nome.
-- **`--unknown-year omit`**: omite o segmento de ano.
+- **`--unknown-year sd`**: insere um **placeholder** no lugar do ano (por omissão `s.d.`).
+- **`--unknown-year-text TEXTO`**: texto desse placeholder (ex.: `ND`, `sem data`, `????`); caracteres inválidos para nome de ficheiro são normalizados. Se ficar vazio, volta a `s.d.`. Só vale com `sd`.
+- **`--unknown-year omit`**: omite o segmento de ano quando não há data (fica `AUTOR - Título`; com ano, `AUTOR - Ano - Título`).
+- **`--omit-date-if-missing`**: atalho para o mesmo efeito que **`omit`** (útil se já usares `sd` noutro script e quiseres esta flag explícita). Se passares `sd` e esta flag, prevalece `omit` (aviso no stderr).
 
 ### Log só de itens sem ano
 
-Gera um CSV com caminho original e **nome como ficaria com `s.d.`** forçado:
+Gera um CSV com caminho original e **nome como ficaria com o placeholder de ano** (modo `sd`, texto em **`--unknown-year-text`**) forçado:
 
 ```bash
 python renomear_ebooks.py "E:\Livros" --source all --missing-year-log

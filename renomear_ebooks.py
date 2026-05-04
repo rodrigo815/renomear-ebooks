@@ -330,6 +330,36 @@ SEARCH_SPEED_TO_SOURCES: dict[int, frozenset[str]] = {
 }
 
 
+MERGE_METADATA_FIELDS: frozenset[str] = frozenset(
+    {"title", "authors", "year", "isbn", "publisher"}
+)
+
+
+def parse_merge_metadata_csv(raw: str) -> frozenset[str]:
+    """Campos de metadado para merge local+remoto: title, authors, year, isbn, publisher."""
+    aliases = {
+        "date": "year",
+        "ano": "year",
+        "author": "authors",
+        "autor": "authors",
+        "autores": "authors",
+        "titulo": "title",
+        "titulo_do_livro": "title",
+        "editora": "publisher",
+    }
+    parts = [p.strip().lower() for p in (raw or "").split(",") if p.strip()]
+    out: set[str] = set()
+    for p in parts:
+        p = aliases.get(p, p)
+        if p not in MERGE_METADATA_FIELDS:
+            allowed = ", ".join(sorted(MERGE_METADATA_FIELDS))
+            raise ValueError(f"campo desconhecido '{p}'; permitidos: {allowed}")
+        out.add(p)
+    if not out:
+        raise ValueError("lista de campos vazia")
+    return frozenset(out)
+
+
 def parse_remote_sources_csv(raw: str) -> frozenset[str]:
     """Lista separada por virgula: openlibrary, google, skoob, catalogs, wikipedia, web."""
     parts = [p.strip().lower() for p in (raw or "").split(",") if p.strip()]
@@ -1220,25 +1250,90 @@ def enrich_weak_authors_from_web(meta: BookMeta, cache: dict[str, Any], sleep_s:
     return dedupe_authors(enriched) or authors
 
 
-def merge_metadata(local: BookMeta, remote: BookMeta | None, prefer_remote_title: bool = False) -> BookMeta:
+def merge_metadata(
+    local: BookMeta,
+    remote: BookMeta | None,
+    prefer_remote_title: bool = False,
+    remote_merge_fields: frozenset[str] | None = None,
+    keep_local_metadata: frozenset[str] | None = None,
+) -> BookMeta:
     if not remote:
         return local
 
-    out = BookMeta(local.path)
+    rmf = remote_merge_fields if remote_merge_fields is not None else MERGE_METADATA_FIELDS
+    klf = keep_local_metadata if keep_local_metadata is not None else frozenset()
 
-    out.title = remote.title if prefer_remote_title and remote.title else (local.title or remote.title)
+    out = BookMeta(local.path)
     local_authors = local.authors or []
     remote_authors = remote.authors or []
-    if local_authors and remote_authors and authors_need_enrichment(local_authors):
-        if surnames_compatible(local_authors, remote_authors):
-            out.authors = remote_authors
-        else:
-            out.authors = local_authors
+
+    def local_nonempty_title() -> bool:
+        return bool(compact_spaces(local.title or ""))
+
+    def local_nonempty_year() -> bool:
+        return bool(compact_spaces(local.year or ""))
+
+    def local_nonempty_isbn() -> bool:
+        return bool(compact_spaces(local.isbn or ""))
+
+    def local_nonempty_publisher() -> bool:
+        return bool(compact_spaces(local.publisher or ""))
+
+    # --- title ---
+    if "title" in klf:
+        out.title = (local.title if local_nonempty_title() else "") or (remote.title or "") or ""
+    elif "title" not in rmf:
+        out.title = local.title or remote.title or ""
     else:
-        out.authors = local_authors or remote_authors or []
-    out.year = remote.year or local.year
-    out.isbn = local.isbn or remote.isbn
-    out.publisher = (local.publisher or "").strip() or (remote.publisher or "").strip()
+        out.title = (
+            remote.title
+            if prefer_remote_title and remote.title
+            else (local.title or remote.title or "")
+        )
+
+    # --- authors ---
+    if "authors" in klf:
+        out.authors = list(local_authors) if local_authors else list(remote_authors or [])
+    elif "authors" not in rmf:
+        out.authors = list(local_authors) if local_authors else list(remote_authors or [])
+    elif local_authors and remote_authors and authors_need_enrichment(local_authors):
+        if surnames_compatible(local_authors, remote_authors):
+            out.authors = list(remote_authors)
+        else:
+            out.authors = list(local_authors)
+    else:
+        out.authors = list(local_authors or remote_authors or [])
+
+    # --- year ---
+    if "year" in klf:
+        out.year = (local.year if local_nonempty_year() else "") or (remote.year or "") or ""
+    elif "year" not in rmf:
+        out.year = local.year or remote.year or ""
+    else:
+        out.year = remote.year or local.year or ""
+
+    # --- isbn ---
+    if "isbn" in klf:
+        out.isbn = (local.isbn if local_nonempty_isbn() else "") or (remote.isbn or "") or ""
+    elif "isbn" not in rmf:
+        out.isbn = local.isbn or remote.isbn or ""
+    else:
+        out.isbn = remote.isbn or local.isbn or ""
+
+    # --- publisher ---
+    if "publisher" in klf:
+        lp = compact_spaces(local.publisher) if local_nonempty_publisher() else ""
+        rp = compact_spaces(remote.publisher or "")
+        out.publisher = lp or rp
+    elif "publisher" not in rmf:
+        lp = (local.publisher or "").strip()
+        rp = (remote.publisher or "").strip()
+        out.publisher = lp or rp
+    else:
+        lp = (local.publisher or "").strip()
+        rp = (remote.publisher or "").strip()
+        out.publisher = rp or lp
+
     out.source = f"{local.source}+{remote.source}"
     out.confidence = max(local.confidence, remote.confidence)
 
@@ -1263,6 +1358,8 @@ def lookup_metadata(
     prefer_remote_title: bool,
     year_strategy: str = "original",
     skip_author_enrich: bool = False,
+    remote_merge_fields: frozenset[str] | None = None,
+    keep_local_metadata: frozenset[str] | None = None,
 ) -> BookMeta:
     remote: BookMeta | None = None
 
@@ -1308,7 +1405,13 @@ def lookup_metadata(
         elif web and not remote.year:
             remote.year = web.year
 
-    merged = merge_metadata(meta, remote, prefer_remote_title=prefer_remote_title)
+    merged = merge_metadata(
+        meta,
+        remote,
+        prefer_remote_title=prefer_remote_title,
+        remote_merge_fields=remote_merge_fields,
+        keep_local_metadata=keep_local_metadata,
+    )
     if not skip_author_enrich and authors_need_enrichment(merged.authors):
         merged.authors = enrich_weak_authors_from_web(merged, cache, sleep_s)
     return merged
@@ -1394,16 +1497,27 @@ _FILENAME_PLACEHOLDER_RE = re.compile(
 )
 
 
+def unknown_year_placeholder(unknown_year: str, label: str) -> str:
+    """Texto do 'ano' quando desconhecido (modo sd); vazio com omit."""
+    if unknown_year != "sd":
+        return ""
+    lab = compact_spaces(label or "")
+    if not lab:
+        lab = "s.d."
+    return safe_filename_part(lab, max_len=48)
+
+
 def default_filename_stem(
     meta: BookMeta,
     overrides: dict[str, str],
     max_authors: int,
     unknown_year: str,
+    unknown_year_label: str = "s.d.",
 ) -> str:
     """Parte do nome sem extensao no padrao historico: AUTOR - ANO - TITULO."""
     title = safe_filename_part(meta.title or Path(meta.path).stem, max_len=120)
     author_part = safe_filename_part(format_authors(meta.authors or [], overrides, max_authors), max_len=90)
-    year = meta.year or ("s.d." if unknown_year == "sd" else "")
+    year = meta.year or unknown_year_placeholder(unknown_year, unknown_year_label)
 
     if author_part and year:
         base = f"{author_part} - {year} - {title}"
@@ -1424,6 +1538,7 @@ def make_new_filename(
     max_authors: int,
     unknown_year: str,
     filename_pattern: str = "",
+    unknown_year_label: str = "s.d.",
 ) -> str:
     ext_l = ext.lower()
     if not ext_l.startswith("."):
@@ -1431,14 +1546,19 @@ def make_new_filename(
 
     pattern = compact_spaces(filename_pattern)
     if not pattern:
-        return default_filename_stem(meta, overrides, max_authors, unknown_year) + ext_l
+        return (
+            default_filename_stem(
+                meta, overrides, max_authors, unknown_year, unknown_year_label=unknown_year_label
+            )
+            + ext_l
+        )
 
     author_fmt = safe_filename_part(
         format_authors(meta.authors or [], overrides, max_authors),
         max_len=120,
     )
     if unknown_year == "sd":
-        date_fmt = meta.year or "s.d."
+        date_fmt = meta.year or unknown_year_placeholder(unknown_year, unknown_year_label)
     else:
         date_fmt = meta.year or ""
     title_fmt = safe_filename_part(meta.title or Path(meta.path).stem, max_len=140)
@@ -1462,10 +1582,17 @@ def make_new_filename(
     has_format = bool(re.search(r"%FORMAT%", pattern, flags=re.I))
     stem = _FILENAME_PLACEHOLDER_RE.sub(repl, pattern)
     stem = compact_spaces(stem)
+    if unknown_year == "omit":
+        stem = re.sub(r"\s+-\s+-\s+", " - ", stem)
     stem = safe_filename_part(stem, max_len=200)
 
     if not stem or stem == "sem_nome":
-        return default_filename_stem(meta, overrides, max_authors, unknown_year) + ext_l
+        return (
+            default_filename_stem(
+                meta, overrides, max_authors, unknown_year, unknown_year_label=unknown_year_label
+            )
+            + ext_l
+        )
 
     if not has_format:
         stem = stem + ext_l
@@ -1640,6 +1767,8 @@ def run_on_root(folder: Path, args: argparse.Namespace) -> tuple[int, int, Path,
                 prefer_remote_title=args.prefer_remote_title,
                 year_strategy=args.year_strategy,
                 skip_author_enrich=args.skip_author_enrich,
+                remote_merge_fields=args.remote_merge_fields,
+                keep_local_metadata=args.keep_local_metadata_fields,
             )
 
         new_name = make_new_filename(
@@ -1649,6 +1778,7 @@ def run_on_root(folder: Path, args: argparse.Namespace) -> tuple[int, int, Path,
             args.max_authors,
             args.unknown_year,
             filename_pattern=args.filename_pattern,
+            unknown_year_label=args.unknown_year_text,
         )
 
         target = unique_target(path, new_name, output_dir, reserved)
@@ -1692,8 +1822,9 @@ def run_on_root(folder: Path, args: argparse.Namespace) -> tuple[int, int, Path,
                 path.suffix,
                 overrides,
                 args.max_authors,
-                "sd",
+                args.unknown_year,
                 filename_pattern=args.filename_pattern,
+                unknown_year_label=args.unknown_year_text,
             )
             missing_year_rows.append(
                 {
@@ -1780,11 +1911,12 @@ def main() -> int:
             "--missing-year-log sem_data.csv --quiet\n\n"
             "  Aplicar de verdade:\n"
             "    python renomear_ebooks.py \"C:\\Livros\" --source all --apply\n\n"
-            "  Forcar rede mesmo quando o PDF ja trouxe um ano (revalidar):\n"
-            "    python renomear_ebooks.py \"C:\\Livros\" --source all --force-remote\n\n"
+            "  Sempre ir a rede (revalidar remoto mesmo com ano local) + so ano do remoto:\n"
+            "    python renomear_ebooks.py \"C:\\Livros\" --source all --force-remote "
+            "--remote-metadata year --keep-local-metadata authors,title\n\n"
             "  Modo rapido (menos rede e menos leitura de PDF):\n"
             "    python renomear_ebooks.py \"C:\\Livros\" --source all --fast --quiet\n\n"
-            "  Modo minucioso (mais PDF + todas as fontes + rede mesmo com ano local):\n"
+            "  Modo minucioso (mais PDF + todas as fontes; rede opcional se ja houver ano local):\n"
             "    python renomear_ebooks.py \"C:\\Livros\" --source all --thorough\n\n"
             "  Velocidade de busca 1 a 5 (so um de --fast, --thorough ou --search-speed):\n"
             "    python renomear_ebooks.py \"C:\\Livros\" --source all --search-speed 3 --quiet\n\n"
@@ -1794,6 +1926,8 @@ def main() -> int:
             "  Nome de ficheiro personalizado:\n"
             "    python renomear_ebooks.py \"C:\\Livros\" --filename-pattern "
             "\"%DATE%_%AUTHOR% - %TITLE%%FORMAT%\" --quiet\n\n"
+            "  Sem segmento de ano quando a data nao existir (AUTOR - Titulo):\n"
+            "    python renomear_ebooks.py \"C:\\Livros\" --omit-date-if-missing --quiet\n\n"
             "Overrides de autores: arquivo JSON (chave = como aparece no metadado/nome; "
             "valor = formato desejado), padrao author_overrides.json na pasta-alvo.\n"
             "Veja README.md na mesma pasta do script para detalhes."
@@ -1840,7 +1974,8 @@ def main() -> int:
             "'all' tenta Open Library, Google Books, Skoob (DDG site:skoob.com.br), "
             "catalogos agregados (DDG site: worldcat, goodreads, storygraph, librarything, "
             "bookbrowse, bookbrainz, amazon, isbndb), Wikipedia e busca web (fallback). "
-            "Se o ano ja foi encontrado na leitura local, a rede e pulada salvo --force-remote. "
+            "Se o ano ja foi encontrado na leitura local, a rede e pulada salvo --force-remote "
+            "(ou --fetch-remote-always). "
             "Combine com --sources ou --search-speed (exige --source all)."
         ),
     )
@@ -1863,6 +1998,27 @@ def main() -> int:
     )
 
     ap.add_argument(
+        "--remote-metadata",
+        default="",
+        metavar="CAMPOS",
+        help=(
+            "Apos a busca remota, quais campos podem ser atualizados a partir do resultado remoto "
+            "(lista separada por virgula). Valores: title, authors, year, isbn, publisher "
+            "(aliases: date, ano, author, autor, autores, titulo, editora). "
+            "Sem esta flag: todos os campos podem receber remoto. Ver tambem --keep-local-metadata."
+        ),
+    )
+    ap.add_argument(
+        "--keep-local-metadata",
+        default="",
+        metavar="CAMPOS",
+        help=(
+            "Campos em que preservar o valor local quando ja preenchido (virgula); o remoto nao "
+            "substitui. Mesmos nomes que --remote-metadata. Ex.: authors,title"
+        ),
+    )
+
+    ap.add_argument(
         "--max-authors",
         type=int,
         default=3,
@@ -1873,7 +2029,29 @@ def main() -> int:
         "--unknown-year",
         choices=["sd", "omit"],
         default="sd",
-        help="Como preencher o ano quando desconhecido: 'sd' insere s.d.; 'omit' omite o segmento de ano.",
+        help=(
+            "Como preencher o ano quando desconhecido: 'sd' insere um placeholder (ver "
+            "--unknown-year-text); 'omit' omite o segmento de ano. Ver tambem --omit-date-if-missing."
+        ),
+    )
+    ap.add_argument(
+        "--omit-date-if-missing",
+        action="store_true",
+        help=(
+            "Sem ano identificado, nao inclui a parte da data no nome (ex.: AUTOR - Titulo.ext). "
+            "Com ano, mantem AUTOR - ANO - TITULO. Equivale a --unknown-year omit; se usar junto "
+            "de sd, esta flag prevalece (mensagem no stderr)."
+        ),
+    )
+    ap.add_argument(
+        "--unknown-year-text",
+        default="s.d.",
+        metavar="TEXTO",
+        help=(
+            "Texto do placeholder de ano quando desconhecido (so com --unknown-year sd). "
+            "Padrao: s.d.. Caracteres invalidos para nome de ficheiro sao normalizados. "
+            "Ignorado com omit. Se vazio apos limpar, volta a s.d.."
+        ),
     )
     ap.add_argument(
         "--filename-pattern",
@@ -1881,7 +2059,7 @@ def main() -> int:
         metavar="PADRAO",
         help=(
             "Modelo do nome do ficheiro em renamed/. Marcadores (case-insensitive): "
-            "%%AUTHOR%%, %%DATE%% (ano; vazio ou s.d. conforme --unknown-year), %%TITLE%%, "
+            "%%AUTHOR%%, %%DATE%% (ano ou --unknown-year-text se sd), %%TITLE%%, "
             "%%PUBLISHER%% (ex.: metadado EPUB), %%FORMAT%% (extensao com ponto, ex. .epub). "
             "Se nao usar %%FORMAT%%, a extensao e acrescentada no fim. "
             "Sem esta flag: padrao SOBRENOME, Nome - Ano - Titulo.ext"
@@ -1928,9 +2106,9 @@ def main() -> int:
         action="store_true",
         help=(
             "Prioriza consistencia: pausa HTTP maior (min. 0.35s); le no minimo 5 paginas de PDF "
-            "(ate 15); forca metadado remoto mesmo se ja houver ano local; com --source all usa "
-            "todas as fontes (incl. Skoob, catalogs agregados, Wikipedia e web). "
-            "Equivale a --search-speed 1 com mais rede/PDF forcados."
+            "(ate 15); com --source all usa todas as fontes (Skoob, catalogs, Wikipedia, web). "
+            "Nao forca por si a rede se ja houver ano local; use --force-remote para isso. "
+            "Equivale a --search-speed 1 no ritmo de rede/PDF (sem alterar --force-remote)."
         ),
     )
     perf.add_argument(
@@ -1941,8 +2119,8 @@ def main() -> int:
         metavar="N",
         help=(
             "Velocidade da busca remota (1 = mais lenta, mais fontes; 5 = mais rapida, so "
-            "Open Library + Google Books). Ajusta tambem pausa HTTP, leitura de PDF e enriquecimento "
-            "de autores. Incompativel com --fast e --thorough (use uma ou outra)."
+            "Open Library + Google Books). Ajusta pausa HTTP, leitura de PDF e enriquecimento "
+            "de autores. Nao ativa por si --force-remote. Incompativel com --fast e --thorough."
         ),
     )
 
@@ -1959,7 +2137,8 @@ def main() -> int:
         metavar="ARQUIVO.csv",
         help=(
             "Gera CSV apenas dos itens sem ano apos metadado final: colunas original, "
-            "novo_com_sd (nome planejado forcando s.d.), titulo, autores, etc. "
+            "novo_com_sd (nome planejado com a mesma regra de --unknown-year / --omit-date-if-missing), "
+            "titulo, autores, etc. "
             "Sem nome apos a flag: usa missing_years.csv em cada PASTA/renamed/. "
             "Com varias PASTAs, evite um unico caminho absoluto comum (cada raiz gravaria o mesmo arquivo)."
         ),
@@ -1985,8 +2164,15 @@ def main() -> int:
     )
     ap.add_argument(
         "--force-remote",
+        "--fetch-remote-always",
         action="store_true",
-        help="Sempre chama fontes remotas mesmo se o ano ja existir na leitura local.",
+        dest="force_remote",
+        help=(
+            "Sempre executa a fase de busca remota (rede), mesmo quando a leitura local ja "
+            "trouxer ano ou outros dados uteis. Sem esta flag, se existir ano local a rede e "
+            "ignorada. Independente de --thorough / --search-speed. Apos a busca, "
+            "--remote-metadata e --keep-local-metadata controlam o merge no metadado final."
+        ),
     )
     ap.add_argument(
         "--quiet",
@@ -2019,6 +2205,39 @@ def main() -> int:
         )
         return 2
 
+    try:
+        args.remote_merge_fields = (
+            parse_merge_metadata_csv(args.remote_metadata)
+            if compact_spaces(args.remote_metadata)
+            else MERGE_METADATA_FIELDS
+        )
+    except ValueError as e:
+        print(f"Erro em --remote-metadata: {e}", file=sys.stderr)
+        return 2
+
+    try:
+        args.keep_local_metadata_fields = (
+            parse_merge_metadata_csv(args.keep_local_metadata)
+            if compact_spaces(args.keep_local_metadata)
+            else frozenset()
+        )
+    except ValueError as e:
+        print(f"Erro em --keep-local-metadata: {e}", file=sys.stderr)
+        return 2
+
+    args.unknown_year_text = compact_spaces(args.unknown_year_text or "")
+    if args.unknown_year == "sd" and not args.unknown_year_text:
+        args.unknown_year_text = "s.d."
+
+    if args.omit_date_if_missing:
+        if args.unknown_year == "sd":
+            print(
+                "Aviso: --omit-date-if-missing equivale a --unknown-year omit "
+                "(sem segmento de ano quando a data nao existir; com ano, o ano continua no nome).",
+                file=sys.stderr,
+            )
+        args.unknown_year = "omit"
+
     if args.fast:
         args.effective_sleep = 0.0
         args.effective_max_pdf_pages = max(0, min(args.max_pdf_pages, 1))
@@ -2027,7 +2246,7 @@ def main() -> int:
     elif args.thorough:
         args.effective_sleep = max(args.sleep, 0.35)
         args.effective_max_pdf_pages = min(max(args.max_pdf_pages, 5), 15)
-        args.effective_force_remote = True
+        args.effective_force_remote = args.force_remote
         args.skip_author_enrich = False
     elif args.search_speed is not None:
         spd = args.search_speed
@@ -2054,7 +2273,7 @@ def main() -> int:
         else:
             args.effective_sleep = max(args.sleep, 0.35)
             args.effective_max_pdf_pages = min(max(args.max_pdf_pages, 5), 15)
-            args.effective_force_remote = True
+            args.effective_force_remote = args.force_remote
             args.skip_author_enrich = False
     else:
         args.effective_sleep = args.sleep
