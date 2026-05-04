@@ -27,7 +27,9 @@ except Exception:
 
 
 SUPPORTED_EXTS = {".epub", ".pdf", ".mobi", ".azw", ".azw3", ".djvu"}
-IGNORED_DIR_NAMES = {"livros stalin", "anarquismo"}
+# Nomes de pastas (em minusculas) a ignorar na varredura; vazio = nenhuma.
+# Ex.: frozenset({"anarquismo"}) — use so localmente se precisar, sem commitar.
+IGNORED_DIR_NAMES: frozenset[str] = frozenset()
 
 PARTICLES = {
     "da", "de", "do", "das", "dos", "di", "del", "della", "du",
@@ -1221,7 +1223,9 @@ def iter_files(folder: Path, recursive: bool, exclude_dir: Path | None = None) -
     def should_ignore_path(p: Path) -> bool:
         for parent in p.resolve().parents:
             name_lower = parent.name.lower()
-            if name_lower in IGNORED_DIR_NAMES or name_lower.endswith("_files"):
+            if IGNORED_DIR_NAMES and name_lower in IGNORED_DIR_NAMES:
+                return True
+            if name_lower.endswith("_files"):
                 return True
         return False
 
@@ -1291,164 +1295,8 @@ class _HelpFormatter(argparse.ArgumentDefaultsHelpFormatter, argparse.RawDescrip
     """Mostra defaults do argparse e preserva quebras de linha no epilog."""
 
 
-def main() -> int:
-    ap = argparse.ArgumentParser(
-        prog="renomear_ebooks.py",
-        formatter_class=_HelpFormatter,
-        description=(
-            "Renomeia e-books (EPUB, PDF, MOBI, AZW/AZW3, DJVU) para o padrao:\n"
-            "  SOBRENOME, Nome - Ano - Titulo.ext\n\n"
-            "Os arquivos renomeados vao para a subpasta 'renamed' dentro da pasta informada "
-            "(exceto se voce ja apontar diretamente para uma pasta chamada 'renamed').\n"
-            "Sem --apply, apenas simula e grava rename_plan.csv; com --apply, move/renomeia "
-            "e grava rename_log.csv."
-        ),
-        epilog=(
-            "Exemplos:\n"
-            "  Simulacao rapida (50 arquivos, sem rede extra se ja houver ano local):\n"
-            "    python renomear_ebooks.py \"C:\\Livros\" --limit 50 --quiet\n\n"
-            "  Simulacao completa com busca de ano na rede:\n"
-            "    python renomear_ebooks.py \"C:\\Livros\" --source all --sleep 0.25\n\n"
-            "  So itens sem ano (apos leitura local), com log:\n"
-            "    python renomear_ebooks.py \"C:\\Livros\" --source all --only-missing-year "
-            "--missing-year-log sem_data.csv --quiet\n\n"
-            "  Aplicar de verdade:\n"
-            "    python renomear_ebooks.py \"C:\\Livros\" --source all --apply\n\n"
-            "  Forcar rede mesmo quando o PDF ja trouxe um ano (revalidar):\n"
-            "    python renomear_ebooks.py \"C:\\Livros\" --source all --force-remote\n\n"
-            "Overrides de autores: arquivo JSON (chave = como aparece no metadado/nome; "
-            "valor = formato desejado), padrao author_overrides.json na pasta-alvo.\n"
-            "Veja README.md na mesma pasta do script para detalhes."
-        ),
-    )
-
-    ap.add_argument(
-        "folder",
-        metavar="PASTA",
-        help="Pasta raiz que contem os e-books (nao use a subpasta 'renamed' como raiz salvo se quiser ler da biblioteca principal).",
-    )
-    ap.add_argument(
-        "--apply",
-        action="store_true",
-        help="Aplica renomeacoes e move arquivos para PASTA/renamed/. Sem esta flag, so gera o CSV de plano.",
-    )
-    ap.add_argument(
-        "--recursive",
-        action="store_true",
-        help="Inclui subpastas ao listar arquivos (glob recursivo).",
-    )
-
-    ap.add_argument(
-        "--source",
-        choices=["offline", "openlibrary", "google", "wikipedia", "web", "all"],
-        default="all",
-        help=(
-            "Fonte(s) para completar metadado remoto (principalmente ano). "
-            "'offline' nao acessa a rede. "
-            "'all' tenta Open Library + Google Books + Wikipedia + busca web (fallback). "
-            "Se o ano ja foi encontrado na leitura local, a rede e pulada salvo --force-remote."
-        ),
-    )
-
-    ap.add_argument(
-        "--prefer-remote-title",
-        action="store_true",
-        help="Substitui titulo local pelo titulo retornado pela API (pode divergir da edicao que voce tem).",
-    )
-
-    ap.add_argument(
-        "--max-authors",
-        type=int,
-        default=3,
-        help="Numero maximo de autores no nome do arquivo; acima disso usa 'et al.'. Use 0 para listar todos.",
-    )
-
-    ap.add_argument(
-        "--unknown-year",
-        choices=["sd", "omit"],
-        default="sd",
-        help="Como preencher o ano quando desconhecido: 'sd' insere s.d.; 'omit' omite o segmento de ano.",
-    )
-    ap.add_argument(
-        "--year-strategy",
-        choices=["original", "edition"],
-        default="original",
-        help=(
-            "Quando ha varios anos candidatos (APIs, texto): "
-            "'original' prefere o mais antigo plausivel; "
-            "'edition' prefere o mais recente (ex.: reimpressao)."
-        ),
-    )
-
-    ap.add_argument(
-        "--max-pdf-pages",
-        type=int,
-        default=3,
-        help="Quantas paginas iniciais do PDF extrair para ISBN/ano (custo de CPU).",
-    )
-
-    ap.add_argument(
-        "--sleep",
-        type=float,
-        default=0.25,
-        help="Pausa em segundos entre requisicoes HTTP (evita limitar APIs).",
-    )
-
-    ap.add_argument(
-        "--overrides",
-        default="author_overrides.json",
-        help="Caminho para JSON de overrides de autor (relativo a PASTA se nao for absoluto).",
-    )
-    ap.add_argument(
-        "--missing-year-log",
-        nargs="?",
-        const="missing_years.csv",
-        default="",
-        metavar="ARQUIVO.csv",
-        help=(
-            "Gera CSV apenas dos itens sem ano apos metadado final: colunas original, "
-            "novo_com_sd (nome planejado forcando s.d.), titulo, autores, etc. "
-            "Sem nome apos a flag: usa missing_years.csv em PASTA/renamed/."
-        ),
-    )
-    ap.add_argument(
-        "--limit",
-        type=int,
-        default=0,
-        metavar="N",
-        help="Processa no maximo os N primeiros arquivos da lista (ordem alfabetica). 0 = sem limite.",
-    )
-    ap.add_argument(
-        "--jobs",
-        type=int,
-        default=1,
-        metavar="N",
-        help="Threads para leitura local paralela (PDF/EPUB). Aumente em SSD/CPU forte; 1 e o mais seguro.",
-    )
-    ap.add_argument(
-        "--only-missing-year",
-        action="store_true",
-        help="Filtra para arquivos cujo metadado LOCAL nao trouxe ano (antes da etapa remota).",
-    )
-    ap.add_argument(
-        "--force-remote",
-        action="store_true",
-        help="Sempre chama fontes remotas mesmo se o ano ja existir na leitura local.",
-    )
-    ap.add_argument(
-        "--quiet",
-        action="store_true",
-        help="Nao imprime linha a linha no console (o CSV e resumo final continuam).",
-    )
-
-    args = ap.parse_args()
-
-    folder = Path(args.folder).expanduser().resolve()
-
-    if not folder.exists() or not folder.is_dir():
-        print(f"Pasta invalida: {folder}", file=sys.stderr)
-        return 2
-
+def run_on_root(folder: Path, args: argparse.Namespace) -> tuple[int, int, Path, Path, Path | None]:
+    """Processa uma pasta-raiz; retorna (n_arquivos, sem_ano, plan_path, cache_path, missing_path|None)."""
     if folder.name.lower() == "renamed":
         output_dir = folder
     else:
@@ -1458,7 +1306,6 @@ def main() -> int:
     plan_path = output_dir / ("rename_log.csv" if args.apply else "rename_plan.csv")
 
     overrides_path = Path(args.overrides)
-
     if not overrides_path.is_absolute():
         overrides_path = folder / overrides_path
 
@@ -1586,6 +1433,7 @@ def main() -> int:
         writer.writeheader()
         writer.writerows(rows)
 
+    missing_path: Path | None = None
     if args.missing_year_log:
         missing_path = Path(args.missing_year_log)
         if not missing_path.is_absolute():
@@ -1606,16 +1454,199 @@ def main() -> int:
             writer.writeheader()
             writer.writerows(missing_year_rows)
 
-    print(f"\nArquivos analisados: {len(rows)}")
-    print(f"Sem ano identificado: {missing_year_count}")
-    print(f"Plano/log salvo em: {plan_path}")
-    print(f"Cache salvo em: {cache_path}")
-    if args.missing_year_log:
-        print(f"Log de sem-data salvo em: {missing_path}")
+    return len(rows), missing_year_count, plan_path, cache_path, missing_path
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(
+        prog="renomear_ebooks.py",
+        formatter_class=_HelpFormatter,
+        description=(
+            "Renomeia e-books (EPUB, PDF, MOBI, AZW/AZW3, DJVU) para o padrao:\n"
+            "  SOBRENOME, Nome - Ano - Titulo.ext\n\n"
+            "Por padrao, so arquivos diretamente em cada PASTA sao listados; use --recursive "
+            "para incluir subpastas.\n"
+            "Os arquivos renomeados vao para a subpasta 'renamed' dentro de cada pasta informada "
+            "(exceto se a propria PASTA for uma pasta chamada 'renamed').\n"
+            "Sem --apply, apenas simula e grava rename_plan.csv; com --apply, move/renomeia "
+            "e grava rename_log.csv."
+        ),
+        epilog=(
+            "Exemplos:\n"
+            "  Simulacao rapida (50 arquivos, sem rede extra se ja houver ano local):\n"
+            "    python renomear_ebooks.py \"C:\\Livros\" --limit 50 --quiet\n\n"
+            "  Simulacao completa com busca de ano na rede:\n"
+            "    python renomear_ebooks.py \"C:\\Livros\" --source all --sleep 0.25\n\n"
+            "  Varias pastas (cada uma com seu proprio renamed/):\n"
+            "    python renomear_ebooks.py \"D:\\A\" \"D:\\B\" --recursive --quiet\n\n"
+            "  So itens sem ano (apos leitura local), com log:\n"
+            "    python renomear_ebooks.py \"C:\\Livros\" --source all --only-missing-year "
+            "--missing-year-log sem_data.csv --quiet\n\n"
+            "  Aplicar de verdade:\n"
+            "    python renomear_ebooks.py \"C:\\Livros\" --source all --apply\n\n"
+            "  Forcar rede mesmo quando o PDF ja trouxe um ano (revalidar):\n"
+            "    python renomear_ebooks.py \"C:\\Livros\" --source all --force-remote\n\n"
+            "Overrides de autores: arquivo JSON (chave = como aparece no metadado/nome; "
+            "valor = formato desejado), padrao author_overrides.json na pasta-alvo.\n"
+            "Veja README.md na mesma pasta do script para detalhes."
+        ),
+    )
+
+    ap.add_argument(
+        "folders",
+        metavar="PASTA",
+        nargs="+",
+        help=(
+            "Uma ou mais pastas com e-books. Sem --recursive, so entram arquivos no nivel "
+            "imediatamente dentro de cada PASTA (nao desce em subpastas)."
+        ),
+    )
+    ap.add_argument(
+        "--apply",
+        action="store_true",
+        help="Aplica renomeacoes e move arquivos para PASTA/renamed/ de cada raiz. Sem esta flag, so gera o CSV de plano.",
+    )
+    ap.add_argument(
+        "--recursive",
+        action="store_true",
+        help="Inclui arquivos em todas as subpastas de cada PASTA (sem esta flag, so o nivel raiz).",
+    )
+
+    ap.add_argument(
+        "--source",
+        choices=["offline", "openlibrary", "google", "wikipedia", "web", "all"],
+        default="all",
+        help=(
+            "Fonte(s) para completar metadado remoto (principalmente ano). "
+            "'offline' nao acessa a rede. "
+            "'all' tenta Open Library + Google Books + Wikipedia + busca web (fallback). "
+            "Se o ano ja foi encontrado na leitura local, a rede e pulada salvo --force-remote."
+        ),
+    )
+
+    ap.add_argument(
+        "--prefer-remote-title",
+        action="store_true",
+        help="Substitui titulo local pelo titulo retornado pela API (pode divergir da edicao que voce tem).",
+    )
+
+    ap.add_argument(
+        "--max-authors",
+        type=int,
+        default=3,
+        help="Numero maximo de autores no nome do arquivo; acima disso usa 'et al.'. Use 0 para listar todos.",
+    )
+
+    ap.add_argument(
+        "--unknown-year",
+        choices=["sd", "omit"],
+        default="sd",
+        help="Como preencher o ano quando desconhecido: 'sd' insere s.d.; 'omit' omite o segmento de ano.",
+    )
+    ap.add_argument(
+        "--year-strategy",
+        choices=["original", "edition"],
+        default="original",
+        help=(
+            "Quando ha varios anos candidatos (APIs, texto): "
+            "'original' prefere o mais antigo plausivel; "
+            "'edition' prefere o mais recente (ex.: reimpressao)."
+        ),
+    )
+
+    ap.add_argument(
+        "--max-pdf-pages",
+        type=int,
+        default=3,
+        help="Quantas paginas iniciais do PDF extrair para ISBN/ano (custo de CPU).",
+    )
+
+    ap.add_argument(
+        "--sleep",
+        type=float,
+        default=0.25,
+        help="Pausa em segundos entre requisicoes HTTP (evita limitar APIs).",
+    )
+
+    ap.add_argument(
+        "--overrides",
+        default="author_overrides.json",
+        help="JSON de overrides de autor: se caminho relativo, resolve em relacao a cada PASTA.",
+    )
+    ap.add_argument(
+        "--missing-year-log",
+        nargs="?",
+        const="missing_years.csv",
+        default="",
+        metavar="ARQUIVO.csv",
+        help=(
+            "Gera CSV apenas dos itens sem ano apos metadado final: colunas original, "
+            "novo_com_sd (nome planejado forcando s.d.), titulo, autores, etc. "
+            "Sem nome apos a flag: usa missing_years.csv em cada PASTA/renamed/. "
+            "Com varias PASTAs, evite um unico caminho absoluto comum (cada raiz gravaria o mesmo arquivo)."
+        ),
+    )
+    ap.add_argument(
+        "--limit",
+        type=int,
+        default=0,
+        metavar="N",
+        help="Por pasta: no maximo os N primeiros arquivos da lista (ordem alfabetica). 0 = sem limite.",
+    )
+    ap.add_argument(
+        "--jobs",
+        type=int,
+        default=1,
+        metavar="N",
+        help="Threads para leitura local paralela (PDF/EPUB). Aumente em SSD/CPU forte; 1 e o mais seguro.",
+    )
+    ap.add_argument(
+        "--only-missing-year",
+        action="store_true",
+        help="Filtra para arquivos cujo metadado LOCAL nao trouxe ano (antes da etapa remota).",
+    )
+    ap.add_argument(
+        "--force-remote",
+        action="store_true",
+        help="Sempre chama fontes remotas mesmo se o ano ja existir na leitura local.",
+    )
+    ap.add_argument(
+        "--quiet",
+        action="store_true",
+        help="Nao imprime linha a linha no console (o CSV e resumo final continuam).",
+    )
+
+    args = ap.parse_args()
+
+    roots = [Path(f).expanduser().resolve() for f in args.folders]
+    for folder in roots:
+        if not folder.exists() or not folder.is_dir():
+            print(f"Pasta invalida: {folder}", file=sys.stderr)
+            return 2
+
+    total_analysed = 0
+    total_missing = 0
+    n_roots = len(roots)
+
+    for folder in roots:
+        if n_roots > 1 and not args.quiet:
+            print(f"\n--- {folder} ---")
+        n_rows, miss, plan_path, cache_path, missing_path = run_on_root(folder, args)
+        total_analysed += n_rows
+        total_missing += miss
+        print(f"\nArquivos analisados (esta pasta): {n_rows}")
+        print(f"Sem ano identificado (esta pasta): {miss}")
+        print(f"Plano/log salvo em: {plan_path}")
+        print(f"Cache salvo em: {cache_path}")
+        if missing_path is not None:
+            print(f"Log de sem-data salvo em: {missing_path}")
+
+    if n_roots > 1:
+        print(f"\nTotal em {n_roots} pastas: {total_analysed} arquivos, {total_missing} sem ano.")
 
     if not args.apply:
         print("Simulacao apenas. Para renomear de verdade, rode novamente com --apply.")
-        if args.source == "offline" and missing_year_count > 0:
+        if args.source == "offline" and total_missing > 0:
             print(
                 "Dica: use --source all para tentar completar anos (Open Library, Google Books, "
                 "Wikipedia e fallback web)."

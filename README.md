@@ -7,6 +7,8 @@ Script em Python para **renomear e organizar e-books** no padrão:
 Suporta **EPUB**, **PDF**, **MOBI**, **AZW**, **AZW3** e **DJVU**.  
 Os arquivos processados são **movidos/renomeados para a subpasta `renamed`** dentro da pasta que você passar como argumento (exceto se você já rodar apontando diretamente para uma pasta chamada `renamed`).
 
+Por padrão, em **cada** pasta raiz informada, só entram arquivos **no nível imediato** dessa pasta. Use **`--recursive`** para incluir também todas as subpastas.
+
 ---
 
 ## Requisitos
@@ -30,6 +32,12 @@ pip install requests rapidfuzz pypdf
 python renomear_ebooks.py "E:\Livros"
 ```
 
+**Várias pastas** (cada uma com seu próprio `renamed/`):
+
+```bash
+python renomear_ebooks.py "E:\Livros" "D:\OutraPasta" --recursive
+```
+
 **Aplicar** renomeações de verdade:
 
 ```bash
@@ -46,7 +54,7 @@ py -3 renomear_ebooks.py "E:\Livros" --apply
 
 ## Onde ficam os resultados
 
-Dado `PASTA` = pasta da biblioteca (ex.: `E:\Livros`):
+Dado `PASTA` = pasta da biblioteca (ex.: `E:\Livros`). Com **várias** pastas na linha de comando, o mesmo esquema vale **para cada** `PASTA`.
 
 | Caminho | Conteúdo |
 |---------|----------|
@@ -122,7 +130,7 @@ O script **não processa**:
 
 - arquivos `.html`;
 - qualquer pasta cujo nome termine em `_files`;
-- pastas nomeadas **`Livros STALIN`** ou **`Anarquismo`** (e todo conteúdo dentro delas).
+- pastas cujos nomes (em minúsculas) estejam em `IGNORED_DIR_NAMES` no código (por padrão **vazio**, para não obrigar commits com nomes locais). Ajuste só na sua cópia se precisar.
 
 ---
 
