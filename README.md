@@ -4,7 +4,7 @@ Script em Python para **renomear e organizar e-books** no padrão:
 
 `SOBRENOME, Nome - Ano - Titulo.ext`
 
-Suporta **EPUB**, **PDF**, **MOBI**, **AZW**, **AZW3** e **DJVU**.
+Suporta **EPUB**, **PDF**, **MOBI**, **AZW**, **AZW3** e **DJVU**.  
 Os arquivos processados são **movidos/renomeados para a subpasta `renamed`** dentro da pasta que você passar como argumento (exceto se você já rodar apontando diretamente para uma pasta chamada `renamed`).
 
 Por padrão, em **cada** pasta raiz informada, só entram arquivos **no nível imediato** dessa pasta. Use **`--recursive`** para incluir também todas as subpastas.
@@ -268,6 +268,19 @@ O texto de ajuda foi enriquecido (descrição, defaults e exemplos). Rode:
 ```bash
 python renomear_ebooks.py --help
 ```
+
+---
+
+## Testes (pytest)
+
+Na raiz do repositório:
+
+```bash
+pip install -r requirements-dev.txt
+python -m pytest -q tests/
+```
+
+O CI no GitHub (`.github/workflows/python-package.yml`) roda **flake8** e **pytest** nas versões Python do matrix (3.9–3.12). O comando do Actions usa `tests/` explicitamente para não dar *exit code 5* (nenhum teste coletado).
 
 ---
 

@@ -178,6 +178,8 @@ def parse_exts_csv(raw: str) -> frozenset[str]:
             + ", ".join(sorted(SUPPORTED_EXTS))
         )
     return allowed
+
+
 # Nomes de pastas (em minusculas) a ignorar na varredura; vazio = nenhuma.
 # Ex.: frozenset({"anarquismo"}) — use so localmente se precisar, sem commitar.
 IGNORED_DIR_NAMES: frozenset[str] = frozenset()

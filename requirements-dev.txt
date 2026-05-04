@@ -1,0 +1,7 @@
+# Desenvolvimento e CI (pytest + lint)
+pytest>=8.0
+flake8>=7.0
+# Dependencias de runtime do script (import do modulo nos testes)
+requests>=2.28
+rapidfuzz>=3.0
+pypdf>=4.0
