@@ -893,6 +893,17 @@ def _resolve_two_segments_to_authors_and_title(left: str, right: str) -> tuple[l
     return [], clean_title(compact_spaces(f"{left} - {right}"))
 
 
+def _sanitize_mixed_hyphen_underscore(s: str) -> str:
+    """Higieniza misturas Karl_Marx_-_O_Capital ou Karl_Marx - O_Capital antes do parse bipartido."""
+    s = compact_spaces(_normalize_filename_hyphens(s))
+    # Underscores a abraçar hifen(s) → um unico separador " - "
+    s = re.sub(r"_+\s*-\s*_+", " - ", s)
+    s = re.sub(r"_+\s*-", " - ", s)
+    s = re.sub(r"-\s*_+", " - ", s)
+    s = compact_spaces(re.sub(r"(?:\s*-\s*){2,}", " - ", s))
+    return s
+
+
 def _normalize_underscore_separators(s: str) -> str:
     """Trata _, __ e ' _ ' como separador semelhante ao hifen com espacos."""
     s2 = compact_spaces(s)
@@ -906,8 +917,8 @@ def _normalize_underscore_separators(s: str) -> str:
 
 
 def _expand_filename_separators_for_bipartite(stem: str) -> str:
-    """Prepara stem: hifens unicode + underscores candidatos a separador Autor/Titulo."""
-    s = _normalize_filename_hyphens(compact_spaces(stem))
+    """Prepara stem: higieniza _/- mistos, depois underscores restantes (Autor/Titulo)."""
+    s = _sanitize_mixed_hyphen_underscore(stem)
     s = _normalize_underscore_separators(s)
     return compact_spaces(s)
 
