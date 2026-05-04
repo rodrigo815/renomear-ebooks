@@ -3,16 +3,19 @@ from __future__ import annotations
 import argparse
 import concurrent.futures
 import csv
+import difflib
+import os
+from collections import defaultdict
 import hashlib
 import json
 import logging
 import re
 import sys
+import tempfile
 import time
 import urllib.parse
 import zipfile
-import xml.etree.ElementTree as ET
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -21,9 +24,73 @@ import requests
 from rapidfuzz import fuzz
 
 try:
+    import defusedxml.ElementTree as ET  # type: ignore[import-not-found]
+    _HAS_DEFUSED_XML = True
+except ImportError:
+    import xml.etree.ElementTree as ET  # type: ignore[no-redef]
+    _HAS_DEFUSED_XML = False
+
+try:
     from pypdf import PdfReader
 except Exception:
     PdfReader = None
+
+
+_HTTP_SESSION: requests.Session | None = None
+
+
+def _get_http_session() -> requests.Session:
+    """Sessao global com keep-alive; evita reabrir conexao a cada GET."""
+    global _HTTP_SESSION
+    if _HTTP_SESSION is None:
+        s = requests.Session()
+        adapter = requests.adapters.HTTPAdapter(
+            pool_connections=8, pool_maxsize=16, max_retries=0
+        )
+        s.mount("https://", adapter)
+        s.mount("http://", adapter)
+        s.headers.update({"User-Agent": "ebook-renamer/1.0"})
+        _HTTP_SESSION = s
+    return _HTTP_SESSION
+
+
+def _resolved_path(p: Path, _cache: dict[Path, Path] = {}) -> Path:
+    """resolve() em cache por instancia (poupa syscalls em loops)."""
+    rp = _cache.get(p)
+    if rp is None:
+        try:
+            rp = p.resolve()
+        except OSError:
+            rp = p.absolute()
+        _cache[p] = rp
+    return rp
+
+
+_CSV_FORMULA_PREFIXES = ("=", "+", "-", "@")
+
+
+def _csv_safe(value: Any) -> str:
+    """Anti formula-injection: prefixa "'" em celulas que abrem com =, +, -, @, TAB, CR."""
+    if value is None:
+        return ""
+    s = str(value)
+    if not s:
+        return s
+    first = s[0]
+    if first in _CSV_FORMULA_PREFIXES or first in ("\t", "\r"):
+        return "'" + s
+    return s
+
+
+def _csv_safe_row(row: dict[str, Any]) -> dict[str, str]:
+    return {k: _csv_safe(v) for k, v in row.items()}
+
+
+_WINDOWS_RESERVED_NAMES = frozenset({
+    "con", "prn", "aux", "nul",
+    *(f"com{i}" for i in range(1, 10)),
+    *(f"lpt{i}" for i in range(1, 10)),
+})
 
 
 SUPPORTED_EXTS = frozenset({".epub", ".pdf", ".mobi", ".azw", ".azw3", ".djvu"})
@@ -93,13 +160,19 @@ class BookMeta:
     year: str = ""
     isbn: str = ""
     publisher: str = ""
+    series: str = ""
+    subjects: list[str] | None = None
     source: str = ""
     confidence: float = 0.0
     notes: str = ""
+    match_score: int = 0
+    evidence: dict[str, str] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         if self.authors is None:
             self.authors = []
+        if self.subjects is None:
+            self.subjects = []
 
 
 def compact_spaces(s: str) -> str:
@@ -279,13 +352,21 @@ def safe_filename_part(s: str, max_len: int = 180) -> str:
     for old, new in replacements.items():
         s = s.replace(old, new)
 
-    s = re.sub(r"[\x00-\x1f]", "", s)
+    s = re.sub(r"[\x00-\x1f\x7f]", "", s)
+    s = re.sub(r"\.{2,}", ".", s)
     s = re.sub(r"\s+", " ", s).strip(" .")
 
     if len(s) > max_len:
         s = s[:max_len].rstrip(" .-_")
 
-    return s or "sem_nome"
+    if not s:
+        return "sem_nome"
+
+    base = s.split(".", 1)[0].lower() if "." in s else s.lower()
+    if base in _WINDOWS_RESERVED_NAMES:
+        s = "_" + s
+
+    return s
 
 
 def extract_year_candidates(s: str) -> list[int]:
@@ -602,12 +683,30 @@ def parse_filename_fallback(path: Path) -> BookMeta:
     return BookMeta(str(path), clean_title(title), authors, year, source="filename", confidence=0.15)
 
 
+_EPUB_MAX_XML_BYTES = 8 * 1024 * 1024  # 8 MiB para metadados (container/OPF)
+
+
+def _safe_zip_read(z: zipfile.ZipFile, name: str, max_bytes: int) -> bytes:
+    """Le um membro do zip com limite de tamanho (mitiga zip-bomb / OPF gigantes)."""
+    try:
+        info = z.getinfo(name)
+    except KeyError as exc:
+        raise FileNotFoundError(name) from exc
+    if info.file_size > max_bytes:
+        raise ValueError(f"membro {name!r} excede {max_bytes} bytes")
+    with z.open(info, "r") as fh:
+        data = fh.read(max_bytes + 1)
+    if len(data) > max_bytes:
+        raise ValueError(f"membro {name!r} maior que limite ao descomprimir")
+    return data
+
+
 def read_epub_metadata(path: Path) -> BookMeta:
     meta = BookMeta(str(path), source="epub", confidence=0.5)
 
     try:
         with zipfile.ZipFile(path) as z:
-            container_xml = z.read("META-INF/container.xml")
+            container_xml = _safe_zip_read(z, "META-INF/container.xml", _EPUB_MAX_XML_BYTES)
             root = ET.fromstring(container_xml)
 
             ns = {"c": "urn:oasis:names:tc:opendocument:xmlns:container"}
@@ -617,38 +716,63 @@ def read_epub_metadata(path: Path) -> BookMeta:
                 raise ValueError("rootfile ausente no EPUB")
 
             opf_path = rootfile.attrib["full-path"]
-            opf = ET.fromstring(z.read(opf_path))
+            if "\x00" in opf_path or opf_path.startswith("/") or ".." in opf_path.split("/"):
+                raise ValueError("OPF path suspeito")
 
-            def texts(tag: str) -> list[str]:
-                vals = []
+            opf_bytes = _safe_zip_read(z, opf_path, _EPUB_MAX_XML_BYTES)
+            opf = ET.fromstring(opf_bytes)
 
-                for el in opf.iter():
-                    if el.tag.endswith("}" + tag) or el.tag == tag:
-                        if el.text and compact_spaces(el.text):
-                            vals.append(compact_spaces(el.text))
+            titles: list[str] = []
+            creators: list[str] = []
+            identifiers: list[str] = []
+            dates: list[str] = []
+            publishers: list[str] = []
+            subjects_acc: list[str] = []
+            series_val = ""
 
-                return vals
-
-            titles = texts("title")
-            creators = texts("creator")
-            identifiers = texts("identifier")
-            dates = texts("date")
-            publishers = texts("publisher")
+            for el in opf.iter():
+                tag = el.tag
+                local = tag.split("}", 1)[1] if "}" in tag else tag
+                if local in {"title", "creator", "identifier", "date", "publisher", "subject"}:
+                    txt = compact_spaces(el.text or "")
+                    if not txt:
+                        continue
+                    if local == "title":
+                        titles.append(txt)
+                    elif local == "creator":
+                        creators.append(txt)
+                    elif local == "identifier":
+                        identifiers.append(txt)
+                    elif local == "date":
+                        dates.append(txt)
+                    elif local == "publisher":
+                        publishers.append(txt)
+                    elif local == "subject":
+                        subjects_acc.append(txt)
+                elif local == "meta" and not series_val:
+                    name = (el.attrib.get("name") or "").lower()
+                    if name == "calibre:series":
+                        series_val = compact_spaces(el.attrib.get("content") or "")
 
             if titles:
                 meta.title = clean_title(titles[0])
-
             if creators:
                 meta.authors = split_authors(creators)
-
             if publishers:
                 meta.publisher = compact_spaces(publishers[0])
-
             if identifiers:
                 meta.isbn = find_isbn(" ".join(identifiers))
-
             if dates:
                 meta.year = year_from_string(" ".join(dates))
+            if series_val:
+                meta.series = series_val
+            if subjects_acc:
+                seen: set[str] = set()
+                for t in subjects_acc:
+                    k = t.lower()
+                    if k not in seen:
+                        seen.add(k)
+                        meta.subjects.append(t)
 
     except Exception as e:
         meta.notes = f"falha ao ler EPUB: {e}"
@@ -692,13 +816,13 @@ def read_pdf_metadata(path: Path, max_pages: int = 3, year_strategy: str = "orig
         if author and not author_looks_bad(str(author)):
             meta.authors = split_authors(str(author))
 
-        text = ""
-
+        chunks: list[str] = []
         for page in reader.pages[:max_pages]:
             try:
-                text += "\n" + (page.extract_text() or "")
+                chunks.append(page.extract_text() or "")
             except Exception:
-                pass
+                continue
+        text = "\n".join(chunks)
 
         meta.isbn = find_isbn(text)
 
@@ -789,6 +913,9 @@ def cache_key(url: str, params: dict[str, Any] | None) -> str:
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
 
+_HTML_CACHE_TRUNCATE = 96 * 1024  # 96 KiB de HTML por entrada (suficiente p/ snippets)
+
+
 def get_json(url: str, params: dict[str, Any] | None, cache: dict[str, Any], sleep_s: float) -> Any:
     key = cache_key(url, params)
 
@@ -796,14 +923,11 @@ def get_json(url: str, params: dict[str, Any] | None, cache: dict[str, Any], sle
         return cache[key]
 
     try:
-        time.sleep(sleep_s)
+        if sleep_s > 0:
+            time.sleep(sleep_s)
 
-        r = requests.get(
-            url,
-            params=params,
-            timeout=20,
-            headers={"User-Agent": "ebook-renamer/1.0"},
-        )
+        session = _get_http_session()
+        r = session.get(url, params=params, timeout=20)
 
         r.raise_for_status()
         ctype = (r.headers.get("Content-Type", "") or "").lower()
@@ -811,12 +935,41 @@ def get_json(url: str, params: dict[str, Any] | None, cache: dict[str, Any], sle
             data = r.json()
         else:
             data = r.text
+            if len(data) > _HTML_CACHE_TRUNCATE:
+                data = data[:_HTML_CACHE_TRUNCATE]
         cache[key] = data
         return data
 
-    except Exception as e:
-        cache[key] = {"_error": str(e)}
+    except requests.exceptions.RequestException as e:
+        return {"_error": f"{type(e).__name__}: {e}"}
+    except ValueError as e:
+        cache[key] = {"_error": f"json: {e}"}
         return cache[key]
+
+
+def _subjects_from_openlibrary_isbn(data: dict[str, Any], limit: int = 25) -> list[str]:
+    out: list[str] = []
+    for s in (data.get("subjects") or [])[:limit]:
+        if isinstance(s, dict):
+            nm = compact_spaces(str(s.get("name", "") or s.get("title", "")))
+            if nm:
+                out.append(nm)
+        elif isinstance(s, str) and compact_spaces(s):
+            out.append(compact_spaces(s))
+    return out
+
+
+def _subjects_from_openlibrary_search_doc(doc: dict[str, Any], limit: int = 25) -> list[str]:
+    raw = doc.get("subject") or doc.get("subject_key") or []
+    out: list[str] = []
+    if isinstance(raw, str):
+        raw = [raw]
+    if not isinstance(raw, (list, tuple)):
+        return out
+    for s in raw[:limit]:
+        if isinstance(s, str) and compact_spaces(s):
+            out.append(compact_spaces(s))
+    return out
 
 
 def best_openlibrary(
@@ -839,6 +992,7 @@ def best_openlibrary(
                     authors=[],
                     year=year,
                     isbn=meta.isbn,
+                    subjects=_subjects_from_openlibrary_isbn(data),
                     source="openlibrary:isbn",
                     confidence=0.75,
                 )
@@ -907,6 +1061,7 @@ def best_openlibrary(
         authors=split_authors(doc.get("author_name", [])[:3]) or meta.authors,
         year=year,
         isbn=meta.isbn,
+        subjects=_subjects_from_openlibrary_search_doc(doc),
         source="openlibrary:search",
         confidence=round(score / 100, 3),
     )
@@ -975,6 +1130,16 @@ def best_googlebooks(meta: BookMeta, cache: dict[str, Any], sleep_s: float) -> B
     score, info = best
     year = year_from_string(str(info.get("publishedDate", "")))
     pub = compact_spaces(str(info.get("publisher") or ""))
+    subj: list[str] = []
+    for c in (info.get("categories") or [])[:12]:
+        for part in str(c).split("/"):
+            p = compact_spaces(part)
+            if p and p.lower() not in {x.lower() for x in subj}:
+                subj.append(p)
+    series = ""
+    si = info.get("seriesInfo")
+    if isinstance(si, dict):
+        series = compact_spaces(str(si.get("title") or si.get("series") or ""))
 
     return BookMeta(
         meta.path,
@@ -983,6 +1148,8 @@ def best_googlebooks(meta: BookMeta, cache: dict[str, Any], sleep_s: float) -> B
         year=year,
         isbn=meta.isbn,
         publisher=pub,
+        series=series,
+        subjects=subj,
         source="googlebooks",
         confidence=round(score / 100, 3),
     )
@@ -1337,6 +1504,22 @@ def merge_metadata(
     out.source = f"{local.source}+{remote.source}"
     out.confidence = max(local.confidence, remote.confidence)
 
+    def _uniq_subjects(seq: list[str]) -> list[str]:
+        seen: set[str] = set()
+        outl: list[str] = []
+        for x in seq:
+            c = compact_spaces(str(x))
+            k = c.lower()
+            if c and k not in seen:
+                seen.add(k)
+                outl.append(c)
+        return outl[:40]
+
+    lsu = list(local.subjects or [])
+    rsu = list(remote.subjects or [])
+    out.subjects = _uniq_subjects(lsu + rsu)
+    out.series = compact_spaces(remote.series) or compact_spaces(local.series)
+
     notes = []
 
     if local.notes:
@@ -1348,6 +1531,77 @@ def merge_metadata(
     out.notes = " | ".join(notes)
 
     return out
+
+
+REVIEW_SCORE_AUTO = 90
+REVIEW_SCORE_PROMPT = 70
+
+
+def compute_match_evidence(local: BookMeta, merged: BookMeta) -> tuple[int, dict[str, str]]:
+    """Pontuacao 0-100 e dicionario explicativo (concordancia local vs metadado final)."""
+    ev: dict[str, str] = {}
+    score = 0
+
+    lt = normalize_for_match(local.title or "")
+    mt = normalize_for_match(merged.title or "")
+    if lt and mt:
+        tr = fuzz.token_set_ratio(lt, mt)
+        ev["titulo"] = f"similaridade {tr}%"
+        if tr >= 95:
+            score += 40
+        elif tr >= 85:
+            score += 32
+        elif tr >= 70:
+            score += 22
+    elif not lt and mt:
+        ev["titulo"] = "titulo local vazio"
+        score += 10
+
+    la = normalize_for_match(" ".join(local.authors or []))
+    ma = normalize_for_match(" ".join(merged.authors or []))
+    if la and ma:
+        ar = fuzz.token_set_ratio(la, ma)
+        ev["autores"] = f"similaridade {ar}%"
+        if ar >= 88:
+            score += 30
+        elif ar >= 72:
+            score += 22
+        elif ar < 45:
+            score -= 40
+            ev["autores"] += "; penalizacao divergencia"
+    elif not la and ma:
+        score += 12
+        ev["autores"] = "autor local vazio"
+
+    li = re.sub(r"[^0-9Xx]", "", local.isbn or "")
+    mi = re.sub(r"[^0-9Xx]", "", merged.isbn or "")
+    if li and mi and li == mi:
+        score += 20
+        ev["isbn"] = "local e remoto iguais"
+    elif mi and not li:
+        score += 10
+        ev["isbn"] = "ISBN so remoto"
+
+    lp = normalize_for_match(local.publisher or "")
+    mp = normalize_for_match(merged.publisher or "")
+    if lp and mp and fuzz.token_set_ratio(lp, mp) >= 80:
+        score += 10
+        ev["editora"] = "concordancia"
+
+    src = merged.source or ""
+    if "+" in src:
+        parts = [p for p in src.split("+") if p.strip()]
+        if len(parts) >= 2:
+            score += 15
+            ev["fontes"] = "varias fontes no merge: " + src.replace("+", " + ")
+
+    tit = merged.title or ""
+    if re.search(r".+:.+", tit) and len(tit) > 55:
+        score -= 25
+        ev["titulo"] = (ev.get("titulo", "") + "; possivel subtitulo longo").strip("; ")
+
+    score = max(0, min(100, score))
+    return score, ev
 
 
 def lookup_metadata(
@@ -1371,11 +1625,21 @@ def lookup_metadata(
 
         if not remote:
             remote = gb
-        elif gb and not remote.year:
-            remote.year = gb.year
-
+        elif gb:
+            if not remote.year:
+                remote.year = gb.year
             if not remote.authors:
                 remote.authors = gb.authors
+            rsu = list(remote.subjects or [])
+            seen_s = {x.lower() for x in rsu}
+            for s in gb.subjects or []:
+                c = compact_spaces(str(s))
+                if c and c.lower() not in seen_s:
+                    seen_s.add(c.lower())
+                    rsu.append(c)
+            remote.subjects = rsu[:40]
+            if gb.series and not compact_spaces(remote.series or ""):
+                remote.series = gb.series
 
     if (not remote or not remote.year) and "skoob" in enabled_remote_sources:
         sk = best_skoob_year(meta, cache, sleep_s, year_strategy=year_strategy)
@@ -1601,8 +1865,16 @@ def make_new_filename(
 
 
 def unique_target(src: Path, filename: str, target_dir: Path, reserved: set[Path]) -> Path:
-    target = (target_dir / filename).resolve()
-    src_resolved = src.resolve()
+    safe = safe_filename_part(Path(filename).stem, max_len=200) + Path(filename).suffix.lower()
+    target_dir_resolved = _resolved_path(target_dir)
+    target = (target_dir / safe).resolve()
+
+    try:
+        target.relative_to(target_dir_resolved)
+    except ValueError:
+        target = (target_dir / ("sem_nome" + Path(filename).suffix.lower())).resolve()
+
+    src_resolved = _resolved_path(src)
 
     if target == src_resolved:
         return target
@@ -1627,17 +1899,8 @@ def iter_files(
     allowed_exts: frozenset[str] | None = None,
 ) -> list[Path]:
     pattern = "**/*" if recursive else "*"
-    exclude_dir_resolved = exclude_dir.resolve() if exclude_dir else None
+    exclude_dir_resolved = _resolved_path(exclude_dir) if exclude_dir else None
     exts = allowed_exts if allowed_exts is not None else SUPPORTED_EXTS
-
-    def should_ignore_path(p: Path) -> bool:
-        for parent in p.resolve().parents:
-            name_lower = parent.name.lower()
-            if IGNORED_DIR_NAMES and name_lower in IGNORED_DIR_NAMES:
-                return True
-            if name_lower.endswith("_files"):
-                return True
-        return False
 
     def allow_suffix(suf: str) -> bool:
         s = suf.lower()
@@ -1645,16 +1908,26 @@ def iter_files(
             return s in SUPPORTED_EXTS and s != ".html"
         return s in exts
 
-    files = [
-        p for p in folder.glob(pattern)
-        if p.is_file()
-        and allow_suffix(p.suffix)
-        and (
-            exclude_dir_resolved is None
-            or exclude_dir_resolved not in p.resolve().parents
-        )
-        and not should_ignore_path(p)
-    ]
+    files: list[Path] = []
+    for p in folder.glob(pattern):
+        try:
+            if not p.is_file():
+                continue
+        except OSError:
+            continue
+        if not allow_suffix(p.suffix):
+            continue
+        rp = _resolved_path(p)
+        parents = list(rp.parents)
+        if exclude_dir_resolved is not None and exclude_dir_resolved in parents:
+            continue
+        if any(
+            (IGNORED_DIR_NAMES and parent.name.lower() in IGNORED_DIR_NAMES)
+            or parent.name.lower().endswith("_files")
+            for parent in parents
+        ):
+            continue
+        files.append(p)
 
     return sorted(files, key=lambda p: str(p).lower())
 
@@ -1670,7 +1943,556 @@ def load_json(path: Path) -> dict[str, Any]:
 
 
 def save_json(path: Path, data: dict[str, Any]) -> None:
-    path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+    """Escrita atomica: grava em ficheiro temporario na mesma pasta e renomeia."""
+    payload = json.dumps(data, ensure_ascii=False, indent=2)
+    target_dir = path.parent
+    target_dir.mkdir(parents=True, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(
+        prefix=f".{path.name}.", suffix=".tmp", dir=str(target_dir)
+    )
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8", newline="") as fh:
+            fh.write(payload)
+        os.replace(tmp, path)
+    except OSError:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
+def write_catalog_entries(
+    output_dir: Path, entries: list[dict[str, Any]], fmt: str
+) -> list[Path]:
+    """Grava catalog.json e/ou catalog.csv em output_dir (ex.: PASTA/renamed/)."""
+    out_paths: list[Path] = []
+    if fmt in ("json", "both"):
+        jp = output_dir / "catalog.json"
+        jp.write_text(json.dumps(entries, ensure_ascii=False, indent=2), encoding="utf-8")
+        out_paths.append(jp)
+    if fmt in ("csv", "both"):
+        cp = output_dir / "catalog.csv"
+        fields = [
+            "original_path",
+            "renamed_path",
+            "renamed_filename",
+            "status",
+            "title",
+            "authors",
+            "year",
+            "isbn",
+            "publisher",
+            "series",
+            "subjects",
+            "source",
+            "confidence",
+            "match_score",
+        ]
+        with cp.open("w", encoding="utf-8-sig", newline="") as f:
+            w = csv.DictWriter(f, fieldnames=fields)
+            w.writeheader()
+            for e in entries:
+                row: dict[str, Any] = {k: e.get(k, "") for k in fields}
+                if isinstance(e.get("authors"), list):
+                    row["authors"] = "; ".join(e["authors"])
+                if isinstance(e.get("subjects"), list):
+                    row["subjects"] = "; ".join(e["subjects"])
+                w.writerow(_csv_safe_row(row))
+        out_paths.append(cp)
+    return out_paths
+
+
+def _file_hash_digest(path: Path, algo: str) -> str:
+    h = hashlib.md5() if algo == "md5" else hashlib.sha1()
+    with path.open("rb") as f:
+        while True:
+            chunk = f.read(1024 * 1024)
+            if not chunk:
+                break
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def _quality_for_dedup_pick(meta: BookMeta) -> tuple[int, int, int, int, int]:
+    return (
+        1 if compact_spaces(meta.year or "") else 0,
+        1 if compact_spaces(meta.publisher or "") else 0,
+        1 if compact_spaces(meta.isbn or "") else 0,
+        len(compact_spaces(meta.title or "")),
+        len(compact_spaces(" ".join(meta.authors or []))),
+    )
+
+
+def run_dedup_hashes(folder: Path, args: argparse.Namespace) -> Path:
+    """Agrupa ficheiros com o mesmo MD5/SHA1; gera renamed/duplicates.csv; opcionalmente move duplicados."""
+    if folder.name.lower() == "renamed":
+        output_dir = folder
+    else:
+        output_dir = (folder / "renamed").resolve()
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    files = iter_files(
+        folder,
+        args.recursive,
+        exclude_dir=None,
+        allowed_exts=args.ext_filter,
+    )
+    if args.limit and args.limit > 0:
+        files = files[: args.limit]
+
+    algo = getattr(args, "dedup_algorithm", "sha1")
+    pairs = build_local_metadata(
+        files,
+        max_pdf_pages=min(args.effective_max_pdf_pages, 2),
+        year_strategy=args.year_strategy,
+        jobs=max(1, args.jobs),
+    )
+    meta_by: dict[Path, BookMeta] = {_resolved_path(p): m for p, m in pairs}
+
+    sizes_by: dict[Path, int] = {}
+    for p in files:
+        try:
+            sizes_by[p] = p.stat().st_size
+        except OSError:
+            sizes_by[p] = 0
+
+    size_buckets: defaultdict[int, list[Path]] = defaultdict(list)
+    for p in files:
+        size_buckets[sizes_by[p]].append(p)
+
+    candidates: list[Path] = []
+    for sz, plist in size_buckets.items():
+        if sz > 0 and len(plist) >= 2:
+            candidates.extend(plist)
+
+    buckets: defaultdict[str, list[Path]] = defaultdict(list)
+    if candidates:
+        n_jobs = max(1, args.jobs)
+        if n_jobs == 1:
+            for path in candidates:
+                try:
+                    dig = _file_hash_digest(path, algo)
+                except OSError as e:
+                    print(f"Aviso: nao foi possivel ler {path}: {e}", file=sys.stderr)
+                    continue
+                buckets[dig].append(path)
+        else:
+            with concurrent.futures.ThreadPoolExecutor(max_workers=n_jobs) as ex:
+                fut_to_path = {ex.submit(_file_hash_digest, p, algo): p for p in candidates}
+                for fut in concurrent.futures.as_completed(fut_to_path):
+                    p = fut_to_path[fut]
+                    try:
+                        dig = fut.result()
+                    except OSError as e:
+                        print(f"Aviso: nao foi possivel ler {p}: {e}", file=sys.stderr)
+                        continue
+                    buckets[dig].append(p)
+
+    clusters = [(d, lst) for d, lst in buckets.items() if len(lst) >= 2]
+    report_path = output_dir / "duplicates.csv"
+    dup_dir = output_dir / "duplicates"
+    if args.delete_dups:
+        dup_dir.mkdir(parents=True, exist_ok=True)
+
+    def sk_sort(p: Path) -> tuple[tuple[int, int, int, int, int], int]:
+        m = meta_by.get(_resolved_path(p), BookMeta(str(p)))
+        return (_quality_for_dedup_pick(m), sizes_by.get(p, 0))
+
+    rows: list[dict[str, str]] = []
+    for gi, (dig, paths_in_group) in enumerate(clusters, start=1):
+        sorted_paths = sorted(paths_in_group, key=sk_sort, reverse=True)
+        keeper = sorted_paths[0]
+        keeper_bn = keeper.name.lower()
+
+        for p in sorted_paths:
+            m = meta_by.get(_resolved_path(p), BookMeta(str(p)))
+            sz = str(sizes_by.get(p, 0))
+            role = "manter" if p == keeper else "duplicado"
+            sim_pct = str(
+                round(
+                    100.0
+                    * difflib.SequenceMatcher(
+                        None, keeper_bn, p.name.lower()
+                    ).ratio(),
+                    1,
+                )
+            )
+            rows.append(
+                {
+                    "grupo": str(gi),
+                    "algoritmo": algo,
+                    "digest": dig,
+                    "caminho": str(p),
+                    "bytes": sz,
+                    "titulo": m.title or "",
+                    "ano": m.year or "",
+                    "editora": m.publisher or "",
+                    "funcao": role,
+                    "similaridade_nomes_pct": sim_pct,
+                }
+            )
+            if args.delete_dups and p != keeper:
+                dest = dup_dir / p.name
+                n = 2
+                while dest.exists():
+                    dest = dup_dir / f"{p.stem} ({n}){p.suffix}"
+                    n += 1
+                try:
+                    p.rename(dest)
+                except OSError as e:
+                    print(f"Erro ao mover duplicado {p}: {e}", file=sys.stderr)
+
+    fields = [
+        "grupo",
+        "algoritmo",
+        "digest",
+        "caminho",
+        "bytes",
+        "titulo",
+        "ano",
+        "editora",
+        "funcao",
+        "similaridade_nomes_pct",
+    ]
+    with report_path.open("w", encoding="utf-8-sig", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=fields)
+        w.writeheader()
+        for row in rows:
+            w.writerow(_csv_safe_row(row))
+
+    if clusters:
+        print(f"Duplicados por hash ({algo}): {report_path} ({len(rows)} linhas).")
+    else:
+        print(f"Nenhum grupo com hash identico. CSV vazio (cabecalho): {report_path}")
+    if args.delete_dups and clusters:
+        print(f"Duplicados movidos para: {_resolved_path(dup_dir)}")
+    return report_path
+
+
+def resolve_supplementary_path(raw: Path, folder: Path) -> Path | None:
+    """Resolve caminho do ficheiro suplementar: absoluto, cwd, ou relativo a folder."""
+    if raw.is_absolute():
+        return raw if raw.is_file() else None
+    p = raw.expanduser()
+    if p.is_file():
+        return p.resolve()
+    q = (folder / p).expanduser()
+    if q.is_file():
+        return q.resolve()
+    return None
+
+
+def _authors_from_cell(val: Any) -> list[str]:
+    if val is None:
+        return []
+    if isinstance(val, list):
+        return [compact_spaces(str(x)) for x in val if compact_spaces(str(x))]
+    s = compact_spaces(str(val))
+    if not s:
+        return []
+    if ";" in s:
+        return [compact_spaces(x) for x in s.split(";") if compact_spaces(x)]
+    if "," in s:
+        return [compact_spaces(x) for x in s.split(",") if compact_spaces(x)]
+    return [s]
+
+
+def _norm_path_lookup_key(p: str) -> str:
+    try:
+        return os.path.normcase(str(Path(p).expanduser().resolve()))
+    except OSError:
+        return os.path.normcase(compact_spaces(p))
+
+
+def _row_dict_to_bookmeta(row: dict[str, Any], source_label: str) -> BookMeta | None:
+    """Extrai chave de correspondencia e BookMeta a partir de um dict com chaves normalizadas."""
+    def _s(key: str) -> str:
+        v = row.get(key)
+        if v is None:
+            return ""
+        if isinstance(v, (dict, list)) and key != "authors":
+            return ""
+        return compact_spaces(str(v))
+
+    path_key = (
+        _s("path")
+        or _s("original")
+        or _s("filepath")
+        or _s("file")
+        or _s("filename")
+    )
+    if not path_key:
+        return None
+    title = _s("title") or _s("titulo")
+    year = _s("year") or _s("ano")
+    isbn = _s("isbn")
+    publisher = _s("publisher") or _s("editora")
+    notes = _s("notes") or _s("notas")
+    authors = _authors_from_cell(row.get("authors") if row.get("authors") is not None else row.get("autores"))
+    series = _s("series") or _s("serie") or _s("coletanea")
+    subjects = _authors_from_cell(
+        row.get("subjects") if row.get("subjects") is not None else row.get("assuntos")
+    )
+    return BookMeta(
+        path=path_key,
+        title=title,
+        authors=authors,
+        year=year,
+        isbn=isbn,
+        publisher=publisher,
+        series=series,
+        subjects=subjects,
+        source=f"supplement:{source_label}",
+        confidence=1.0,
+        notes=notes,
+    )
+
+
+def _normalize_header_map(headers: list[str]) -> dict[str, str]:
+    """Mapeia nome de coluna original -> chave canonica."""
+    canon = {
+        "path": "path",
+        "original": "original",
+        "filepath": "filepath",
+        "file": "file",
+        "filename": "filename",
+        "titulo": "title",
+        "title": "title",
+        "autores": "authors",
+        "authors": "authors",
+        "ano": "year",
+        "year": "year",
+        "isbn": "isbn",
+        "editora": "publisher",
+        "publisher": "publisher",
+        "notas": "notes",
+        "notes": "notes",
+        "series": "series",
+        "serie": "series",
+        "coletanea": "series",
+        "subjects": "subjects",
+        "assuntos": "subjects",
+        "temas": "subjects",
+    }
+    out: dict[str, str] = {}
+    for h in headers:
+        k = compact_spaces(h).lower()
+        if k in canon:
+            out[h] = canon[k]
+    return out
+
+
+def _parse_supplementary_json(data: Any, source_label: str) -> list[BookMeta]:
+    out: list[BookMeta] = []
+    if isinstance(data, dict):
+        if "records" in data and isinstance(data["records"], list):
+            data = data["records"]
+        elif "files" in data and isinstance(data["files"], list):
+            data = data["files"]
+        elif data and all(isinstance(v, dict) for v in data.values()):
+            for k, v in data.items():
+                if not isinstance(v, dict):
+                    continue
+                d = {str(k2).lower(): v2 for k2, v2 in v.items()}
+                d["path"] = compact_spaces(str(k))
+                bm = _row_dict_to_bookmeta(d, source_label)
+                if bm:
+                    out.append(bm)
+            return out
+        else:
+            return out
+    if not isinstance(data, list):
+        return out
+    for item in data:
+        if not isinstance(item, dict):
+            continue
+        row = {str(k).lower(): v for k, v in item.items()}
+        bm = _row_dict_to_bookmeta(row, source_label)
+        if bm:
+            out.append(bm)
+    return out
+
+
+def _dict_rows_from_csv_reader(path: Path, delim: str | None) -> list[dict[str, str]]:
+    text = path.read_text(encoding="utf-8-sig")
+    if not text.strip():
+        return []
+    sample = text[: 4096]
+    if delim is None:
+        try:
+            dialect = csv.Sniffer().sniff(sample, delimiters=",;\t")
+            delim = dialect.delimiter
+        except csv.Error:
+            delim = ","
+    lines = text.splitlines()
+    reader = csv.DictReader(lines, delimiter=delim)
+    if not reader.fieldnames:
+        return []
+    hmap = _normalize_header_map(list(reader.fieldnames))
+    rows: list[dict[str, str]] = []
+    for raw in reader:
+        uni: dict[str, str] = {}
+        for ok, v in raw.items():
+            if ok is None:
+                continue
+            nk = hmap.get(ok, ok.strip().lower())
+            if isinstance(v, str):
+                uni[nk] = v.strip()
+            else:
+                uni[nk] = str(v or "").strip()
+        rows.append(uni)
+    return rows
+
+
+class SupplementaryIndex:
+    """Indice de metadados extra: correspondencia por caminho resolvido ou por nome do ficheiro."""
+
+    def __init__(
+        self, items: list[BookMeta], label: str, base_folder: Path | None = None
+    ) -> None:
+        self.label = label
+        self.by_resolved: dict[str, BookMeta] = {}
+        self.by_basename: dict[str, list[BookMeta]] = defaultdict(list)
+        for m in items:
+            raw = compact_spaces(m.path)
+            if not raw:
+                continue
+            try:
+                pr = Path(raw)
+                if pr.is_absolute():
+                    self.by_resolved[_norm_path_lookup_key(raw)] = m
+                elif base_folder is not None:
+                    self.by_resolved[_norm_path_lookup_key(str((base_folder / pr).resolve()))] = m
+            except OSError:
+                pass
+            bn = Path(raw).name.lower()
+            if bn:
+                self.by_basename[bn].append(m)
+
+    def lookup(self, file_path: Path, local: BookMeta | None) -> BookMeta | None:
+        try:
+            rk = os.path.normcase(str(file_path.resolve()))
+        except OSError:
+            rk = ""
+        if rk and rk in self.by_resolved:
+            return self.by_resolved[rk]
+        bn = file_path.name.lower()
+        cand = self.by_basename.get(bn, [])
+        if not cand:
+            return None
+        if len(cand) == 1:
+            return cand[0]
+        if local:
+            lt = normalize_for_match(local.title or file_path.stem)
+            scored: list[tuple[int, BookMeta]] = []
+            for c in cand:
+                rt = normalize_for_match(c.title or "")
+                scored.append((fuzz.token_set_ratio(lt, rt) if rt else 0, c))
+            scored.sort(key=lambda t: t[0], reverse=True)
+            if scored[0][0] < 55:
+                return None
+            return scored[0][1]
+        return cand[0]
+
+
+def merge_supplementary_override(base: BookMeta, sup: BookMeta) -> BookMeta:
+    """Campos nao vazios no suplemento substituem o metadado ja obtido."""
+    au = list(sup.authors or []) if sup.authors and any(compact_spaces(a) for a in sup.authors) else list(base.authors or [])
+    ser = (
+        compact_spaces(sup.series)
+        if compact_spaces(sup.series)
+        else compact_spaces(base.series)
+    )
+    if sup.subjects and any(compact_spaces(x) for x in sup.subjects):
+        subs_src = list(sup.subjects)
+    else:
+        subs_src = list(base.subjects or [])
+    seen: set[str] = set()
+    subs: list[str] = []
+    for x in subs_src:
+        c = compact_spaces(str(x))
+        k = c.lower()
+        if c and k not in seen:
+            seen.add(k)
+            subs.append(c)
+    subs = subs[:40]
+
+    return BookMeta(
+        path=base.path,
+        title=compact_spaces(sup.title) or base.title,
+        authors=au,
+        year=compact_spaces(sup.year) or base.year,
+        isbn=compact_spaces(sup.isbn) or base.isbn,
+        publisher=compact_spaces(sup.publisher) or base.publisher,
+        series=ser,
+        subjects=subs,
+        source=(
+            f"{compact_spaces(base.source)}+supplement(override)"
+            if compact_spaces(base.source or "")
+            else "supplement(override)"
+        ),
+        confidence=max(base.confidence, sup.confidence or 1.0),
+        notes=" | ".join(x for x in (base.notes, sup.notes) if compact_spaces(x)),
+    )
+
+
+def apply_supplementary_merged(
+    local: BookMeta,
+    meta: BookMeta,
+    sup_index: SupplementaryIndex | None,
+    args: argparse.Namespace,
+) -> BookMeta:
+    if sup_index is None:
+        return meta
+    sup = sup_index.lookup(Path(meta.path), local)
+    if sup is None:
+        return meta
+    if getattr(args, "supplementary_mode", "merge") == "override":
+        return merge_supplementary_override(meta, sup)
+    return merge_metadata(
+        meta,
+        sup,
+        prefer_remote_title=args.prefer_remote_title,
+        remote_merge_fields=args.remote_merge_fields,
+        keep_local_metadata=args.keep_local_metadata_fields,
+    )
+
+
+def load_supplementary_data(
+    path: Path, base_folder: Path | None = None
+) -> SupplementaryIndex | None:
+    label = str(path)
+    ext = path.suffix.lower()
+    items: list[BookMeta] = []
+    try:
+        if ext == ".json":
+            raw_j = path.read_text(encoding="utf-8-sig")
+            data = json.loads(raw_j)
+            items = _parse_supplementary_json(data, path.name)
+        elif ext in (".csv", ".txt"):
+            delim = "\t" if ext == ".txt" else None
+            rows = _dict_rows_from_csv_reader(path, delim)
+            for uni in rows:
+                bm = _row_dict_to_bookmeta(uni, path.name)
+                if bm:
+                    items.append(bm)
+        else:
+            print(
+                f"Aviso: --supplementary-data suporta .json, .csv ou .txt (recebido: {ext or '(sem)'}).",
+                file=sys.stderr,
+            )
+            return None
+    except OSError as e:
+        print(f"Erro ao ler ficheiro suplementar {path}: {e}", file=sys.stderr)
+        return None
+    except json.JSONDecodeError as e:
+        print(f"JSON invalido em {path}: {e}", file=sys.stderr)
+        return None
+    if not items:
+        print(f"Aviso: nenhum registo util em {path}", file=sys.stderr)
+        return None
+    return SupplementaryIndex(items, label, base_folder)
 
 
 def build_local_metadata(
@@ -1710,8 +2532,89 @@ class _HelpFormatter(argparse.ArgumentDefaultsHelpFormatter, argparse.RawDescrip
     """Mostra defaults do argparse e preserva quebras de linha no epilog."""
 
 
-def run_on_root(folder: Path, args: argparse.Namespace) -> tuple[int, int, Path, Path, Path | None]:
-    """Processa uma pasta-raiz; retorna (n_arquivos, sem_ano, plan_path, cache_path, missing_path|None)."""
+def _review_band(score: int) -> str:
+    if score >= REVIEW_SCORE_AUTO:
+        return "auto"
+    if score >= REVIEW_SCORE_PROMPT:
+        return "review"
+    return "doubt"
+
+
+def interactive_review_item(
+    path: Path,
+    local: BookMeta,
+    meta: BookMeta,
+    proposed_name: str,
+    output_dir: Path,
+    reserved: set[Path],
+    overrides: dict[str, str],
+    max_authors: int,
+    args: argparse.Namespace,
+) -> tuple[str, Path, str]:
+    """Devolve (novo_nome, alvo, escolha) com escolha em accept|edit|skip|always_author."""
+    print("\n--- Revisao ---")
+    print(f"Original:\n  {path.name}\n")
+    print(f"Sugestao:\n  {proposed_name}\n")
+    print(f"Pontuacao: {meta.match_score}%")
+    band = _review_band(meta.match_score)
+    print(
+        "Faixa: "
+        + (
+            "automatico (>=90%)"
+            if band == "auto"
+            else "revisar (70-89%)" if band == "review" else "duvidoso (<70%)"
+        )
+    )
+    print(f"Confianca (metadado): {round(100 * meta.confidence)}%")
+    print(f"Fonte: {meta.source or '(local)'}\n")
+    if meta.evidence:
+        print("Evidencias:")
+        for k, v in sorted(meta.evidence.items()):
+            print(f"  - {k}: {v}")
+    suf = path.suffix.lower()
+    while True:
+        try:
+            raw = input(
+                "[A]ceitar / [E]ditar nome / [P]ular / [S]empre este autor (aceita e grava override): "
+            ).strip()
+        except EOFError:
+            raw = "A"
+        ch = (raw[:1] or "A").upper()
+        if ch == "A":
+            tgt = unique_target(path, proposed_name, output_dir, reserved)
+            return proposed_name, tgt, "accept"
+        if ch == "P":
+            return path.name, path.resolve(), "skip"
+        if ch == "E":
+            print("Novo nome de ficheiro (com ou sem extensao; se omitir extensao, mantem-se a actual).")
+            try:
+                ed = input("> ").strip()
+            except EOFError:
+                ed = ""
+            if not ed:
+                continue
+            p_ed = Path(ed)
+            stem = p_ed.stem
+            ext_new = p_ed.suffix.lower() or suf
+            newn = safe_filename_part(stem, max_len=200) + ext_new
+            tgt = unique_target(path, newn, output_dir, reserved)
+            return newn, tgt, "edit"
+        if ch == "S":
+            lk = getattr(args, "review_author_lock", None)
+            if lk is not None and local.authors:
+                a0 = local.authors[0]
+                lk[a0] = "; ".join(
+                    format_authors(meta.authors or [], overrides, max_authors)
+                )
+            tgt = unique_target(path, proposed_name, output_dir, reserved)
+            return proposed_name, tgt, "always_author"
+        print("Opcao invalida (use A, E, P ou S).")
+
+
+def run_on_root(
+    folder: Path, args: argparse.Namespace
+) -> tuple[int, int, Path, Path, Path | None, Path | None]:
+    """Processa uma pasta-raiz; retorna (..., missing_path|None, review_needed_path|None)."""
     if folder.name.lower() == "renamed":
         output_dir = folder
     else:
@@ -1726,6 +2629,17 @@ def run_on_root(folder: Path, args: argparse.Namespace) -> tuple[int, int, Path,
 
     cache = load_json(cache_path)
     overrides = load_json(overrides_path)
+
+    sup_index: SupplementaryIndex | None = None
+    if compact_spaces(getattr(args, "supplementary_data", "")):
+        sp = resolve_supplementary_path(Path(args.supplementary_data), folder)
+        if sp:
+            sup_index = load_supplementary_data(sp, folder)
+        else:
+            print(
+                f"Aviso: ficheiro --supplementary-data nao encontrado: {args.supplementary_data}",
+                file=sys.stderr,
+            )
 
     exclude_dir = output_dir if output_dir != folder else None
     files = iter_files(
@@ -1750,6 +2664,8 @@ def run_on_root(folder: Path, args: argparse.Namespace) -> tuple[int, int, Path,
     rows: list[dict[str, str]] = []
     missing_year_rows: list[dict[str, str]] = []
     missing_year_count = 0
+    review_needed_rows: list[dict[str, str]] = []
+    catalog_entries: list[dict[str, Any]] = []
 
     for path, local in local_pairs:
         should_use_offline = (
@@ -1770,11 +2686,21 @@ def run_on_root(folder: Path, args: argparse.Namespace) -> tuple[int, int, Path,
                 remote_merge_fields=args.remote_merge_fields,
                 keep_local_metadata=args.keep_local_metadata_fields,
             )
+        meta = apply_supplementary_merged(local, meta, sup_index, args)
+        ms, evd = compute_match_evidence(local, meta)
+        if sup_index and "supplement" in (meta.source or "").lower():
+            evd["suplemento"] = f"ficheiro: {Path(sup_index.label).name}"
+        meta.match_score = ms
+        meta.evidence = evd
+
+        eo: dict[str, str] = dict(overrides)
+        if getattr(args, "review_author_lock", None):
+            eo.update(args.review_author_lock)
 
         new_name = make_new_filename(
             meta,
             path.suffix,
-            overrides,
+            eo,
             args.max_authors,
             args.unknown_year,
             filename_pattern=args.filename_pattern,
@@ -1782,14 +2708,38 @@ def run_on_root(folder: Path, args: argparse.Namespace) -> tuple[int, int, Path,
         )
 
         target = unique_target(path, new_name, output_dir, reserved)
+        review_choice = "auto"
+        band = _review_band(meta.match_score)
 
-        status = "igual" if target.resolve() == path.resolve() else "planejado"
+        if getattr(args, "review", False) and not should_use_offline and band != "auto":
+            reserved.discard(target)
+            new_name, target, review_choice = interactive_review_item(
+                path,
+                local,
+                meta,
+                new_name,
+                output_dir,
+                reserved,
+                eo,
+                args.max_authors,
+                args,
+            )
 
-        if args.apply and status != "igual":
+        path_resolved = _resolved_path(path)
+        target_resolved = _resolved_path(target)
+        status = "igual" if target_resolved == path_resolved else "planejado"
+        if review_choice == "skip":
+            status = "pulado_revisao"
+            new_name = path.name
+            reserved.discard(target)
+            target = path_resolved
+            target_resolved = path_resolved
+
+        if args.apply and status == "planejado":
             try:
                 path.rename(target)
                 status = "renomeado"
-            except Exception as e:
+            except OSError as e:
                 status = f"erro: {e}"
 
         rows.append(
@@ -1803,11 +2753,33 @@ def run_on_root(folder: Path, args: argparse.Namespace) -> tuple[int, int, Path,
                 "isbn": meta.isbn,
                 "fonte": meta.source,
                 "confianca": str(meta.confidence),
+                "pontuacao": str(meta.match_score),
+                "evidencias": json.dumps(meta.evidence or {}, ensure_ascii=False),
                 "notas": meta.notes,
             }
         )
 
-        line = f"{status}: {path.name} -> {target.name}"
+        if getattr(args, "generate_catalog", False):
+            catalog_entries.append(
+                {
+                    "original_path": str(path),
+                    "renamed_path": str(target),
+                    "renamed_filename": Path(target).name,
+                    "status": status,
+                    "title": meta.title or "",
+                    "authors": list(meta.authors or []),
+                    "year": meta.year or "",
+                    "isbn": meta.isbn or "",
+                    "publisher": meta.publisher or "",
+                    "series": meta.series or "",
+                    "subjects": list(meta.subjects or []),
+                    "source": meta.source or "",
+                    "confidence": meta.confidence,
+                    "match_score": meta.match_score,
+                }
+            )
+
+        line = f"{status}: {path.name} -> {Path(target).name}"
         if not args.quiet:
             try:
                 print(line)
@@ -1815,12 +2787,26 @@ def run_on_root(folder: Path, args: argparse.Namespace) -> tuple[int, int, Path,
                 safe_line = line.encode("cp1252", errors="replace").decode("cp1252", errors="replace")
                 print(safe_line)
 
+        if getattr(args, "review", False) and band != "auto":
+            review_needed_rows.append(
+                {
+                    "original": str(path),
+                    "novo_sugerido": str(target) if review_choice != "skip" else "",
+                    "pontuacao": str(meta.match_score),
+                    "faixa": band,
+                    "escolha_revisao": review_choice,
+                    "titulo": meta.title,
+                    "autores": "; ".join(meta.authors or []),
+                    "evidencias": json.dumps(meta.evidence or {}, ensure_ascii=False),
+                }
+            )
+
         if not meta.year:
             missing_year_count += 1
             missing_name = make_new_filename(
                 meta,
                 path.suffix,
-                overrides,
+                eo,
                 args.max_authors,
                 args.unknown_year,
                 filename_pattern=args.filename_pattern,
@@ -1853,12 +2839,36 @@ def run_on_root(folder: Path, args: argparse.Namespace) -> tuple[int, int, Path,
                 "isbn",
                 "fonte",
                 "confianca",
+                "pontuacao",
+                "evidencias",
                 "notas",
             ],
         )
 
         writer.writeheader()
-        writer.writerows(rows)
+        for row in rows:
+            writer.writerow(_csv_safe_row(row))
+
+    review_path_out: Path | None = None
+    if getattr(args, "review", False):
+        review_path_out = output_dir / "review_needed.csv"
+        with review_path_out.open("w", encoding="utf-8-sig", newline="") as rf:
+            rw = csv.DictWriter(
+                rf,
+                fieldnames=[
+                    "original",
+                    "novo_sugerido",
+                    "pontuacao",
+                    "faixa",
+                    "escolha_revisao",
+                    "titulo",
+                    "autores",
+                    "evidencias",
+                ],
+            )
+            rw.writeheader()
+            for row in review_needed_rows:
+                rw.writerow(_csv_safe_row(row))
 
     missing_path: Path | None = None
     if args.missing_year_log:
@@ -1879,9 +2889,244 @@ def run_on_root(folder: Path, args: argparse.Namespace) -> tuple[int, int, Path,
                 ],
             )
             writer.writeheader()
-            writer.writerows(missing_year_rows)
+            for row in missing_year_rows:
+                writer.writerow(_csv_safe_row(row))
 
-    return len(rows), missing_year_count, plan_path, cache_path, missing_path
+    if getattr(args, "generate_catalog", False):
+        for wp in write_catalog_entries(
+            output_dir,
+            catalog_entries,
+            getattr(args, "catalog_format", "json"),
+        ):
+            if not args.quiet:
+                print(f"Catalogo salvo em: {wp}")
+
+    return len(rows), missing_year_count, plan_path, cache_path, missing_path, review_path_out
+
+
+def _partial_file_fingerprint(path: Path, head_bytes: int = 65536) -> str:
+    try:
+        sz = path.stat().st_size
+    except OSError:
+        return ""
+    h = hashlib.sha256()
+    h.update(str(sz).encode("ascii", errors="ignore"))
+    try:
+        with path.open("rb") as f:
+            h.update(f.read(head_bytes))
+    except OSError:
+        return ""
+    return h.hexdigest()[:24]
+
+
+def _parse_prefer_format_csv(raw: str) -> list[str]:
+    out: list[str] = []
+    for p in (raw or "").split(","):
+        e = p.strip().lower()
+        if not e:
+            continue
+        if not e.startswith("."):
+            e = "." + e
+        out.append(e)
+    return out
+
+
+def _dup_author_title_key(meta: BookMeta) -> str | None:
+    t = normalize_for_match(meta.title or "")
+    a = normalize_for_match(" ".join(meta.authors or []))
+    if len(t) < 5:
+        return None
+    return f"at:{a}|{t}"
+
+
+def _dup_isbn_key(meta: BookMeta) -> str | None:
+    d = re.sub(r"[^0-9Xx]", "", meta.isbn or "")
+    if len(d) < 10:
+        return None
+    return f"isbn:{d}"
+
+
+class _UnionFind:
+    def __init__(self) -> None:
+        self.p: dict[str, str] = {}
+        self.r: dict[str, int] = {}
+
+    def find(self, x: str) -> str:
+        if x not in self.p:
+            self.p[x] = x
+            self.r[x] = 0
+            return x
+        chain: list[str] = []
+        cur = x
+        while self.p[cur] != cur:
+            chain.append(cur)
+            cur = self.p[cur]
+        for node in chain:
+            self.p[node] = cur
+        return cur
+
+    def union(self, a: str, b: str) -> None:
+        ra, rb = self.find(a), self.find(b)
+        if ra == rb:
+            return
+        if self.r[ra] < self.r[rb]:
+            ra, rb = rb, ra
+        self.p[rb] = ra
+        if self.r[ra] == self.r[rb]:
+            self.r[ra] += 1
+
+
+def run_find_duplicates(folder: Path, args: argparse.Namespace) -> Path | None:
+    """Agrupa duplicados por ISBN, autor+titulo normalizados e fingerprint parcial; relatorio e opcionalmente move."""
+    if folder.name.lower() == "renamed":
+        output_dir = folder
+    else:
+        output_dir = (folder / "renamed").resolve()
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    files = iter_files(
+        folder,
+        args.recursive,
+        exclude_dir=None,
+        allowed_exts=args.ext_filter,
+    )
+    if args.limit and args.limit > 0:
+        files = files[: args.limit]
+
+    pairs = build_local_metadata(
+        files,
+        max_pdf_pages=args.effective_max_pdf_pages,
+        year_strategy=args.year_strategy,
+        jobs=max(1, args.jobs),
+    )
+
+    uf = _UnionFind()
+    resolved_strs: dict[Path, str] = {p: str(_resolved_path(p)) for p, _ in pairs}
+    path_strs = list(resolved_strs.values())
+
+    def union_str_list(lst: list[str]) -> None:
+        if len(lst) < 2:
+            return
+        b0 = lst[0]
+        for x in lst[1:]:
+            uf.union(b0, x)
+
+    isbn_b: defaultdict[str, list[str]] = defaultdict(list)
+    at_b: defaultdict[str, list[str]] = defaultdict(list)
+    for path, meta in pairs:
+        ps = resolved_strs[path]
+        ik = _dup_isbn_key(meta)
+        if ik:
+            isbn_b[ik].append(ps)
+        ak = _dup_author_title_key(meta)
+        if ak:
+            at_b[ak].append(ps)
+
+    for lst in isbn_b.values():
+        union_str_list(lst)
+    for lst in at_b.values():
+        union_str_list(lst)
+
+    fp_b: defaultdict[str, list[tuple[str, int]]] = defaultdict(list)
+    for path, _meta in pairs:
+        ps = resolved_strs[path]
+        try:
+            sz = path.stat().st_size
+        except OSError:
+            continue
+        if sz < 50_000:
+            continue
+        fp = _partial_file_fingerprint(path)
+        if not fp:
+            continue
+        fp_b[fp].append((ps, sz))
+
+    for items in fp_b.values():
+        lst_ps = [t[0] for t in items]
+        if len(lst_ps) < 2:
+            continue
+        szmap = {t[0]: t[1] for t in items}
+        for ia in range(len(lst_ps)):
+            for ib in range(ia + 1, len(lst_ps)):
+                a, b = lst_ps[ia], lst_ps[ib]
+                s1, s2 = szmap[a], szmap[b]
+                mx = max(s1, s2, 1)
+                if abs(s1 - s2) / mx <= 0.02:
+                    uf.union(a, b)
+
+    comp: dict[str, set[str]] = {}
+    for ps in path_strs:
+        r = uf.find(ps)
+        comp.setdefault(r, set()).add(ps)
+
+    clusters = [frozenset(s) for s in comp.values() if len(s) >= 2]
+    if not clusters:
+        print("Nenhum grupo de duplicados encontrado (ISBN, autor+titulo ou fingerprint+ tamanho).")
+        return None
+
+    order = _parse_prefer_format_csv(args.prefer_format)
+
+    def fmt_rank(p: Path) -> int:
+        suf = p.suffix.lower()
+        try:
+            return order.index(suf)
+        except ValueError:
+            return len(order) + 1
+
+    def sort_key(p: Path) -> tuple[int, int]:
+        try:
+            sz = p.stat().st_size
+        except OSError:
+            sz = 0
+        prefer_big = args.prefer_larger or not args.prefer_smaller
+        return (fmt_rank(p), -sz if prefer_big else sz)
+
+    dr = getattr(args, "duplicates_report", "") or ""
+    if not dr.strip():
+        report_path = output_dir / "duplicates_report.csv"
+    else:
+        report_path = Path(dr)
+        if not report_path.is_absolute():
+            report_path = output_dir / report_path
+
+    dup_dir = folder / "duplicates"
+    if args.move_duplicates:
+        dup_dir.mkdir(parents=True, exist_ok=True)
+
+    rows: list[dict[str, str]] = []
+    for ci, cl in enumerate(clusters, start=1):
+        paths_sorted = sorted((Path(s) for s in cl), key=sort_key)
+        keep = paths_sorted[0]
+        for dup in paths_sorted[1:]:
+            rows.append(
+                {
+                    "grupo": str(ci),
+                    "manter": str(keep),
+                    "duplicado": str(dup),
+                    "acao": "mover" if args.move_duplicates else "apenas_relatorio",
+                }
+            )
+            if args.move_duplicates:
+                dest = dup_dir / dup.name
+                n = 2
+                while dest.exists():
+                    dest = dup_dir / f"{dup.stem} ({n}){dup.suffix}"
+                    n += 1
+                try:
+                    dup.rename(dest)
+                except OSError as e:
+                    print(f"Erro ao mover duplicado {dup}: {e}", file=sys.stderr)
+
+    with report_path.open("w", encoding="utf-8-sig", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=["grupo", "manter", "duplicado", "acao"])
+        w.writeheader()
+        for row in rows:
+            w.writerow(_csv_safe_row(row))
+
+    print(f"Relatorio de duplicados: {report_path} ({len(rows)} linhas).")
+    if args.move_duplicates:
+        print(f"Arquivos movidos para: {_resolved_path(dup_dir)}")
+    return report_path
 
 
 def main() -> int:
@@ -1928,6 +3173,16 @@ def main() -> int:
             "\"%DATE%_%AUTHOR% - %TITLE%%FORMAT%\" --quiet\n\n"
             "  Sem segmento de ano quando a data nao existir (AUTOR - Titulo):\n"
             "    python renomear_ebooks.py \"C:\\Livros\" --omit-date-if-missing --quiet\n\n"
+            "  Revisao interactiva (metadado duvidoso):\n"
+            "    python renomear_ebooks.py \"C:\\Livros\" --source all --review\n\n"
+            "  Detectar duplicados (relatorio em renamed/):\n"
+            "    python renomear_ebooks.py \"C:\\Livros\" --find-duplicates --recursive\n\n"
+            "  Metadado adicional (CSV/JSON junto ao catalogo):\n"
+            "    python renomear_ebooks.py \"C:\\Livros\" --supplementary-data metadados_extra.csv --quiet\n\n"
+            "  Catalogo para Calibre / relatorios (apos simulacao ou apply):\n"
+            "    python renomear_ebooks.py \"C:\\Livros\" --generate-catalog --catalog-format both --quiet\n\n"
+            "  Duplicados por hash de conteudo:\n"
+            "    python renomear_ebooks.py \"C:\\Livros\" --dedup --dedup-algorithm sha1 --recursive\n\n"
             "Overrides de autores: arquivo JSON (chave = como aparece no metadado/nome; "
             "valor = formato desejado), padrao author_overrides.json na pasta-alvo.\n"
             "Veja README.md na mesma pasta do script para detalhes."
@@ -1947,6 +3202,15 @@ def main() -> int:
         "--apply",
         action="store_true",
         help="Aplica renomeacoes e move arquivos para PASTA/renamed/ de cada raiz. Sem esta flag, so gera o CSV de plano.",
+    )
+    ap.add_argument(
+        "--review",
+        action="store_true",
+        help=(
+            "Revisao interactiva item a item quando a pontuacao de concordancia local/remoto for "
+            "70-89 (revisar) ou <70 (duvidoso): aceitar, editar nome, pular ou gravar override do "
+            "autor na sessao. Gera review_needed.csv. Incompativel com --apply."
+        ),
     )
     ap.add_argument(
         "--recursive",
@@ -2130,6 +3394,28 @@ def main() -> int:
         help="JSON de overrides de autor: se caminho relativo, resolve em relacao a cada PASTA.",
     )
     ap.add_argument(
+        "--supplementary-data",
+        default="",
+        metavar="ARQUIVO",
+        help=(
+            "Ficheiro .json, .csv ou .txt (TSV com cabecalho) com metadado extra por ficheiro. "
+            "Identificacao: path, original, filepath, file ou filename (caminho absoluto, relativo "
+            "a PASTA, ou so o nome do ficheiro). Campos: title/titulo, authors/autores, year/ano, "
+            "isbn, publisher/editora, notes/notas. O caminho do ficheiro resolve no cwd e na PASTA. "
+            "JSON: lista de objetos, {\"records\": [...]} ou mapa caminho -> objeto."
+        ),
+    )
+    ap.add_argument(
+        "--supplementary-mode",
+        choices=["merge", "override"],
+        default="merge",
+        help=(
+            "merge: junta o suplemento como mais uma fonte (respeita --remote-metadata e "
+            "--keep-local-metadata). override: cada campo preenchido no suplemento substitui "
+            "o metadado ja obtido."
+        ),
+    )
+    ap.add_argument(
         "--missing-year-log",
         nargs="?",
         const="missing_years.csv",
@@ -2179,8 +3465,96 @@ def main() -> int:
         action="store_true",
         help="Nao imprime linha a linha no console (o CSV e resumo final continuam).",
     )
+    ap.add_argument(
+        "--generate-catalog",
+        action="store_true",
+        help=(
+            "No fim do processamento (simulacao ou --apply), grava catalog.json e/ou catalog.csv "
+            "em PASTA/renamed/ com titulo, autores, ano, ISBN, editora, series (ex.: EPUB Calibre), "
+            "subjects (Open Library / Google Books / EPUB), caminho original e nome planejado."
+        ),
+    )
+    ap.add_argument(
+        "--catalog-format",
+        choices=["json", "csv", "both"],
+        default="json",
+        help="Com --generate-catalog: formato do ficheiro em renamed/.",
+    )
+
+    dup = ap.add_argument_group("duplicados")
+    dup.add_argument(
+        "--find-duplicates",
+        action="store_true",
+        help=(
+            "Apenas detecta grupos de possiveis duplicados (ISBN, autor+titulo normalizado, "
+            "fingerprint parcial + tamanho semelhante). Gera CSV; nao renomeia pela logica normal."
+        ),
+    )
+    dup.add_argument(
+        "--duplicates-report",
+        nargs="?",
+        const="duplicates_report.csv",
+        default="",
+        metavar="ARQUIVO.csv",
+        help=(
+            "Nome ou caminho do CSV de duplicados. Relativo a PASTA/renamed/ se nao for absoluto. "
+            "Com --find-duplicates sem este flag: usa duplicates_report.csv em renamed/."
+        ),
+    )
+    dup.add_argument(
+        "--move-duplicates",
+        action="store_true",
+        help="Com --find-duplicates: move copias nao preferidas para PASTA/duplicates/.",
+    )
+    dup.add_argument(
+        "--prefer-format",
+        default="epub,pdf,azw3,azw,mobi,djvu",
+        metavar="LISTA",
+        help="Ordem de preferencia de extensao para escolher a copia a manter (lista separada por virgula).",
+    )
+    dup.add_argument(
+        "--prefer-larger",
+        action="store_true",
+        help="Com --find-duplicates: prefere o ficheiro maior (comportamento por defeito se nao usar --prefer-smaller).",
+    )
+    dup.add_argument(
+        "--prefer-smaller",
+        action="store_true",
+        help="Com --find-duplicates: prefere o ficheiro menor entre candidatos equiparados.",
+    )
+    dup.add_argument(
+        "--dedup",
+        action="store_true",
+        help=(
+            "Apenas detecta ficheiros com o mesmo conteudo (hash MD5 ou SHA1 de ficheiro completo). "
+            "Gera renamed/duplicates.csv com grupo, digest, caminhos e similaridade de nomes (difflib). "
+            "Distinto de --find-duplicates (metadado / fingerprint parcial)."
+        ),
+    )
+    dup.add_argument(
+        "--dedup-algorithm",
+        choices=["md5", "sha1"],
+        default="sha1",
+        help="Algoritmo para --dedup (le o ficheiro inteiro; pode ser lento em bibliotecas grandes).",
+    )
+    dup.add_argument(
+        "--delete-dups",
+        action="store_true",
+        help=(
+            "Com --dedup: por grupo mantem a copia com metadado mais completo e maior tamanho; "
+            "move as outras para renamed/duplicates/."
+        ),
+    )
 
     args = ap.parse_args()
+    args.review_author_lock = {}
+
+    if not _HAS_DEFUSED_XML:
+        print(
+            "Aviso: defusedxml nao instalado; XML de EPUB e lido com xml.etree (limite de "
+            "tamanho aplicado). Instale 'defusedxml' para defesa adicional contra XML-bomb.",
+            file=sys.stderr,
+        )
 
     try:
         sources_parsed = (
@@ -2314,6 +3688,58 @@ def main() -> int:
             print(f"Pasta invalida: {folder}", file=sys.stderr)
             return 2
 
+    if args.apply and args.review:
+        print("Erro: --apply e --review nao podem ser usados juntos.", file=sys.stderr)
+        return 2
+
+    if args.move_duplicates and not args.find_duplicates:
+        print("Erro: --move-duplicates exige --find-duplicates.", file=sys.stderr)
+        return 2
+
+    if args.prefer_larger and args.prefer_smaller:
+        print("Erro: use apenas uma de --prefer-larger ou --prefer-smaller.", file=sys.stderr)
+        return 2
+
+    if args.delete_dups and not args.dedup:
+        print("Erro: --delete-dups exige --dedup.", file=sys.stderr)
+        return 2
+
+    if args.dedup and args.find_duplicates:
+        print("Erro: --dedup e --find-duplicates sao mutuamente exclusivos.", file=sys.stderr)
+        return 2
+
+    if args.generate_catalog and (args.find_duplicates or args.dedup):
+        print(
+            "Erro: --generate-catalog nao pode ser usado com --find-duplicates ou --dedup.",
+            file=sys.stderr,
+        )
+        return 2
+
+    if args.find_duplicates:
+        if args.apply or args.review:
+            print(
+                "Erro: --find-duplicates nao combina com --apply nem com --review.",
+                file=sys.stderr,
+            )
+            return 2
+        n_roots_dup = len(roots)
+        for folder in roots:
+            if n_roots_dup > 1 and not args.quiet:
+                print(f"\n--- duplicados: {folder} ---")
+            run_find_duplicates(folder, args)
+        return 0
+
+    if args.dedup:
+        if args.apply or args.review:
+            print("Erro: --dedup nao combina com --apply nem com --review.", file=sys.stderr)
+            return 2
+        n_roots_ded = len(roots)
+        for folder in roots:
+            if n_roots_ded > 1 and not args.quiet:
+                print(f"\n--- dedup (hash): {folder} ---")
+            run_dedup_hashes(folder, args)
+        return 0
+
     total_analysed = 0
     total_missing = 0
     n_roots = len(roots)
@@ -2321,7 +3747,7 @@ def main() -> int:
     for folder in roots:
         if n_roots > 1 and not args.quiet:
             print(f"\n--- {folder} ---")
-        n_rows, miss, plan_path, cache_path, missing_path = run_on_root(folder, args)
+        n_rows, miss, plan_path, cache_path, missing_path, review_path = run_on_root(folder, args)
         total_analysed += n_rows
         total_missing += miss
         print(f"\nArquivos analisados (esta pasta): {n_rows}")
@@ -2330,6 +3756,8 @@ def main() -> int:
         print(f"Cache salvo em: {cache_path}")
         if missing_path is not None:
             print(f"Log de sem-data salvo em: {missing_path}")
+        if review_path is not None:
+            print(f"Revisao sugerida (CSV): {review_path}")
 
     if n_roots > 1:
         print(f"\nTotal em {n_roots} pastas: {total_analysed} arquivos, {total_missing} sem ano.")
