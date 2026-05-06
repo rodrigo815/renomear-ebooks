@@ -128,6 +128,23 @@ class TestFilenameUnderscoreAndLongHyphen:
         assert "being there" in (m.title or "").lower()
 
 
+class TestCatalogAuthorLifeDates:
+    def test_paren_bunge_strips_birth_year(self) -> None:
+        m = _fb(
+            "Scientific research. 2, The search for truth "
+            "(Bunge, Mario, 1919-) (z-library.sk, 1lib.sk, z-lib.sk).pdf"
+        )
+        assert m.authors
+        joined = " ".join(m.authors).lower()
+        assert "1919" not in joined
+        assert "bunge" in joined and "mario" in joined
+
+    def test_format_one_author_strips_trailing_lifespan(self) -> None:
+        out = re.format_one_author("Bunge, Mario, 1919-", {})
+        assert "1919" not in out
+        assert "BUNGE" in out and "Mario" in out
+
+
 class TestTrailingParenPublicationYear:
     def test_year_after_title_in_filename(self) -> None:
         m = _fb("Yrjö Engeström - Learning by Expanding (1999).pdf")

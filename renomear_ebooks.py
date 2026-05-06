@@ -774,6 +774,16 @@ def title_variants(title: str) -> list[str]:
     return variants[:5]
 
 
+def _strip_catalog_author_life_span(s: str) -> str:
+    """Remove sufixos catalograficos ', 1919-' ou ', 1919-2020' (datas de vida, nao parte do nome)."""
+    t = compact_spaces(s)
+    if not t:
+        return t
+    t = re.sub(r",\s*\d{4}\s*[-–—]\s*\d{4}\s*$", "", t)
+    t = re.sub(r",\s*\d{4}\s*[-–—]\s*$", "", t)
+    return compact_spaces(t)
+
+
 def split_authors(raw: str | list[str] | None) -> list[str]:
     if not raw:
         return []
@@ -805,7 +815,7 @@ def split_authors(raw: str | list[str] | None) -> list[str]:
     out = []
 
     for item in items:
-        item = compact_spaces(item)
+        item = _strip_catalog_author_life_span(compact_spaces(item))
         if item and item not in out:
             out.append(item)
 
@@ -2405,7 +2415,7 @@ def title_for_filename(meta: BookMeta) -> str:
 
 
 def format_one_author(author: str, overrides: dict[str, str]) -> str:
-    author = compact_spaces(author)
+    author = _strip_catalog_author_life_span(compact_spaces(author))
 
     override = apply_author_overrides(author, overrides)
 
