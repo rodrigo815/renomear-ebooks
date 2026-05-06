@@ -227,6 +227,7 @@ class BookMeta:
     notes: str = ""
     match_score: int = 0
     evidence: dict[str, str] = field(default_factory=dict)
+    source_failures: list[dict[str, str]] = field(default_factory=list)
     # Sufixo de volume/edição extraído do nome (ex.: "Vol.1 3ªed") — sempre no fim do stem.
     filename_extra_suffix: str = ""
     # Ano extraido de sufixo (AAAA) no fim do stem; prevalece sobre remoto no merge.
@@ -1626,7 +1627,41 @@ def cache_key(url: str, params: dict[str, Any] | None) -> str:
 _HTML_CACHE_TRUNCATE = 96 * 1024  # 96 KiB de HTML por entrada (suficiente p/ snippets)
 
 
-def get_json(url: str, params: dict[str, Any] | None, cache: dict[str, Any], sleep_s: float) -> Any:
+def _register_source_failure(
+    source_failures: list[dict[str, str]] | None,
+    source: str | None,
+    reason: str,
+    action: str = "ignored_source_and_continued",
+) -> None:
+    if source_failures is None or not source:
+        return
+    source_failures.append(
+        {"source": source, "reason": compact_spaces(reason), "action": action}
+    )
+
+
+def _classify_external_error(exc: Exception, status_code: int | None = None) -> str:
+    if status_code == 429:
+        return "rate_limit_reached_http_429"
+    if status_code in {500, 502, 503, 504}:
+        return f"http_{status_code}_temporary_unavailable"
+    if isinstance(exc, requests.exceptions.Timeout):
+        return "timeout"
+    if isinstance(exc, requests.exceptions.ConnectionError):
+        return "connection_error"
+    if isinstance(exc, requests.exceptions.HTTPError):
+        return f"http_error_{status_code or 'unknown'}"
+    return f"{type(exc).__name__}: {exc}"
+
+
+def get_json(
+    url: str,
+    params: dict[str, Any] | None,
+    cache: dict[str, Any],
+    sleep_s: float,
+    source: str | None = None,
+    source_failures: list[dict[str, str]] | None = None,
+) -> Any:
     key = cache_key(url, params)
 
     if key in cache:
@@ -1650,10 +1685,19 @@ def get_json(url: str, params: dict[str, Any] | None, cache: dict[str, Any], sle
         cache[key] = data
         return data
 
+    except requests.exceptions.HTTPError as e:
+        status = getattr(getattr(e, "response", None), "status_code", None)
+        reason = _classify_external_error(e, status_code=status)
+        _register_source_failure(source_failures, source, reason)
+        return {"_error": reason}
     except requests.exceptions.RequestException as e:
-        return {"_error": f"{type(e).__name__}: {e}"}
+        reason = _classify_external_error(e)
+        _register_source_failure(source_failures, source, reason)
+        return {"_error": reason}
     except ValueError as e:
-        cache[key] = {"_error": f"json: {e}"}
+        reason = f"invalid_json: {e}"
+        _register_source_failure(source_failures, source, reason)
+        cache[key] = {"_error": reason}
         return cache[key]
 
 
@@ -1687,9 +1731,17 @@ def best_openlibrary(
     cache: dict[str, Any],
     sleep_s: float,
     year_strategy: str = "original",
+    source_failures: list[dict[str, str]] | None = None,
 ) -> BookMeta | None:
     if meta.isbn:
-        data = get_json(f"https://openlibrary.org/isbn/{meta.isbn}.json", None, cache, sleep_s)
+        data = get_json(
+            f"https://openlibrary.org/isbn/{meta.isbn}.json",
+            None,
+            cache,
+            sleep_s,
+            source="openlibrary",
+            source_failures=source_failures,
+        )
 
         if isinstance(data, dict) and "_error" not in data:
             title = data.get("title", "")
@@ -1732,10 +1784,20 @@ def best_openlibrary(
             unique_queries.append(q)
 
     for params in unique_queries[:10]:
-        data = get_json("https://openlibrary.org/search.json", params, cache, sleep_s)
+        data = get_json(
+            "https://openlibrary.org/search.json",
+            params,
+            cache,
+            sleep_s,
+            source="openlibrary",
+            source_failures=source_failures,
+        )
         if not isinstance(data, dict) or "_error" in data:
             continue
         candidates = data.get("docs", []) or []
+        if "docs" not in data:
+            _register_source_failure(source_failures, "openlibrary", "missing_expected_field_docs")
+            continue
 
         for doc in candidates:
             dt = normalize_for_match(str(doc.get("title", "")))
@@ -1778,7 +1840,12 @@ def best_openlibrary(
     )
 
 
-def best_googlebooks(meta: BookMeta, cache: dict[str, Any], sleep_s: float) -> BookMeta | None:
+def best_googlebooks(
+    meta: BookMeta,
+    cache: dict[str, Any],
+    sleep_s: float,
+    source_failures: list[dict[str, str]] | None = None,
+) -> BookMeta | None:
     queries: list[dict[str, Any]] = []
 
     if meta.isbn:
@@ -1815,12 +1882,17 @@ def best_googlebooks(meta: BookMeta, cache: dict[str, Any], sleep_s: float) -> B
             params,
             cache,
             sleep_s,
+            source="google",
+            source_failures=source_failures,
         )
 
         if not isinstance(data, dict) or "_error" in data:
             continue
 
         items = data.get("items", []) or []
+        if "items" not in data:
+            _register_source_failure(source_failures, "google", "missing_expected_field_items")
+            continue
         for item in items:
             info = item.get("volumeInfo", {})
             title = normalize_for_match(info.get("title", ""))
@@ -1872,6 +1944,7 @@ def best_wikipedia(
     cache: dict[str, Any],
     sleep_s: float,
     year_strategy: str = "original",
+    source_failures: list[dict[str, str]] | None = None,
 ) -> BookMeta | None:
     if not meta.title:
         return None
@@ -1901,6 +1974,8 @@ def best_wikipedia(
             },
             cache,
             sleep_s,
+            source="wikipedia",
+            source_failures=source_failures,
         )
         if not isinstance(data, dict) or "_error" in data:
             continue
@@ -1947,6 +2022,7 @@ def best_web_year(
     cache: dict[str, Any],
     sleep_s: float,
     year_strategy: str = "original",
+    source_failures: list[dict[str, str]] | None = None,
 ) -> BookMeta | None:
     if not meta.title:
         return None
@@ -1968,6 +2044,8 @@ def best_web_year(
             {"q": q},
             cache,
             sleep_s,
+            source="web",
+            source_failures=source_failures,
         )
         if not isinstance(data, str):
             continue
@@ -1995,6 +2073,7 @@ def best_skoob_year(
     cache: dict[str, Any],
     sleep_s: float,
     year_strategy: str = "original",
+    source_failures: list[dict[str, str]] | None = None,
 ) -> BookMeta | None:
     """Tenta ano a partir de resultados do Skoob via DuckDuckGo (site:skoob.com.br).
 
@@ -2018,7 +2097,14 @@ def best_skoob_year(
 
     years: list[int] = []
     for q in probes:
-        data = get_json("https://duckduckgo.com/html/", {"q": q}, cache, sleep_s)
+        data = get_json(
+            "https://duckduckgo.com/html/",
+            {"q": q},
+            cache,
+            sleep_s,
+            source="skoob",
+            source_failures=source_failures,
+        )
         if not isinstance(data, str):
             continue
         text = re.sub(r"<[^>]+>", " ", data)
@@ -2046,6 +2132,7 @@ def best_book_catalogs_ddgs_year(
     cache: dict[str, Any],
     sleep_s: float,
     year_strategy: str = "original",
+    source_failures: list[dict[str, str]] | None = None,
 ) -> BookMeta | None:
     """Ano a partir de snippets do DDG restritos a varios catalogos (sem API/chave).
 
@@ -2097,7 +2184,12 @@ def enrich_weak_authors_from_web(meta: BookMeta, cache: dict[str, Any], sleep_s:
         return authors
 
     query = f"\"{title}\" " + " ".join(f"\"{a}\"" for a in authors[:3])
-    data = get_json("https://duckduckgo.com/html/", {"q": query}, cache, sleep_s)
+    data = get_json(
+        "https://duckduckgo.com/html/",
+        {"q": query},
+        cache,
+        sleep_s,
+    )
     if not isinstance(data, str):
         return authors
 
@@ -2264,6 +2356,9 @@ def merge_metadata(
         out.filename_extra_suffix = sfx
 
     out.filename_paren_year = bool(getattr(local, "filename_paren_year", False))
+    out.source_failures = list(getattr(local, "source_failures", []) or []) + list(
+        getattr(remote, "source_failures", []) or []
+    )
 
     return out
 
@@ -2335,6 +2430,14 @@ def compute_match_evidence(local: BookMeta, merged: BookMeta) -> tuple[int, dict
         score -= 25
         ev["titulo"] = (ev.get("titulo", "") + "; possivel subtitulo longo").strip("; ")
 
+    failures = list(getattr(merged, "source_failures", []) or [])
+    if failures:
+        penalty = min(36, 12 * len(failures))
+        score -= penalty
+        ev["falhas_fontes"] = "; ".join(
+            f"{f.get('source', '?')}={f.get('reason', 'unknown')}" for f in failures[:6]
+        )
+
     score = max(0, min(100, score))
     return score, ev
 
@@ -2344,6 +2447,7 @@ def _recover_authors_from_google_by_title(
     enabled_remote_sources: frozenset[str],
     cache: dict[str, Any],
     sleep_s: float,
+    source_failures: list[dict[str, str]] | None = None,
 ) -> BookMeta:
     """Quando nao ha autor utilizavel mas ha titulo, tenta Google Books so com titulo."""
     if merged.authors and not authors_list_looks_bad(merged.authors):
@@ -2353,7 +2457,7 @@ def _recover_authors_from_google_by_title(
     if "google" not in enabled_remote_sources:
         return merged
     probe = replace(merged, authors=[])
-    gb = best_googlebooks(probe, cache, sleep_s)
+    gb = best_googlebooks(probe, cache, sleep_s, source_failures=source_failures)
     if gb and gb.authors and not authors_list_looks_bad(gb.authors):
         out = replace(merged, authors=list(gb.authors))
         append_note(out, "autor recuperado via Google Books (busca por titulo)")
@@ -2373,9 +2477,17 @@ def lookup_metadata(
     keep_local_metadata: frozenset[str] | None = None,
 ) -> BookMeta:
     remote: BookMeta | None = None
+    source_failures: list[dict[str, str]] = []
+
+    def _run_source(source: str, fn, *args, **kwargs):
+        try:
+            return fn(*args, **kwargs, source_failures=source_failures)
+        except Exception as exc:
+            _register_source_failure(source_failures, source, f"source_error: {type(exc).__name__}: {exc}")
+            return None
 
     if "openlibrary" in enabled_remote_sources:
-        remote = best_openlibrary(meta, cache, sleep_s, year_strategy=year_strategy)
+        remote = _run_source("openlibrary", best_openlibrary, meta, cache, sleep_s, year_strategy=year_strategy)
         if _remote_bibliographic_trustworthy(remote):
             merged = merge_metadata(
                 meta,
@@ -2387,12 +2499,20 @@ def lookup_metadata(
             if not skip_author_enrich and authors_need_enrichment(merged.authors):
                 merged.authors = enrich_weak_authors_from_web(merged, cache, sleep_s)
             merged = _recover_authors_from_google_by_title(
-                merged, enabled_remote_sources, cache, sleep_s
+                merged, enabled_remote_sources, cache, sleep_s, source_failures=source_failures
             )
+            merged.source_failures = list(source_failures)
+            if source_failures:
+                merged.confidence = max(0.0, merged.confidence - min(0.35, 0.12 * len(source_failures)))
+                append_note(
+                    merged,
+                    "falhas em fontes externas: "
+                    + "; ".join(f"{x.get('source')}={x.get('reason')}" for x in source_failures[:5]),
+                )
             return merged
 
     if (not remote or not remote.year) and "google" in enabled_remote_sources:
-        gb = best_googlebooks(meta, cache, sleep_s)
+        gb = _run_source("google", best_googlebooks, meta, cache, sleep_s)
 
         if not remote:
             remote = gb
@@ -2413,28 +2533,35 @@ def lookup_metadata(
                 remote.series = gb.series
 
     if (not remote or not remote.year) and "skoob" in enabled_remote_sources:
-        sk = best_skoob_year(meta, cache, sleep_s, year_strategy=year_strategy)
+        sk = _run_source("skoob", best_skoob_year, meta, cache, sleep_s, year_strategy=year_strategy)
         if not remote:
             remote = sk
         elif sk and not remote.year:
             remote.year = sk.year
 
     if (not remote or not remote.year) and "catalogs" in enabled_remote_sources:
-        cat = best_book_catalogs_ddgs_year(meta, cache, sleep_s, year_strategy=year_strategy)
+        cat = _run_source(
+            "catalogs",
+            best_book_catalogs_ddgs_year,
+            meta,
+            cache,
+            sleep_s,
+            year_strategy=year_strategy,
+        )
         if not remote:
             remote = cat
         elif cat and not remote.year:
             remote.year = cat.year
 
     if (not remote or not remote.year) and "wikipedia" in enabled_remote_sources:
-        wk = best_wikipedia(meta, cache, sleep_s, year_strategy=year_strategy)
+        wk = _run_source("wikipedia", best_wikipedia, meta, cache, sleep_s, year_strategy=year_strategy)
         if not remote:
             remote = wk
         elif wk and not remote.year:
             remote.year = wk.year
 
     if (not remote or not remote.year) and "web" in enabled_remote_sources:
-        web = best_web_year(meta, cache, sleep_s, year_strategy=year_strategy)
+        web = _run_source("web", best_web_year, meta, cache, sleep_s, year_strategy=year_strategy)
         if not remote:
             remote = web
         elif web and not remote.year:
@@ -2449,7 +2576,17 @@ def lookup_metadata(
     )
     if not skip_author_enrich and authors_need_enrichment(merged.authors):
         merged.authors = enrich_weak_authors_from_web(merged, cache, sleep_s)
-    merged = _recover_authors_from_google_by_title(merged, enabled_remote_sources, cache, sleep_s)
+    merged = _recover_authors_from_google_by_title(
+        merged, enabled_remote_sources, cache, sleep_s, source_failures=source_failures
+    )
+    merged.source_failures = list(source_failures)
+    if source_failures:
+        merged.confidence = max(0.0, merged.confidence - min(0.35, 0.12 * len(source_failures)))
+        append_note(
+            merged,
+            "falhas em fontes externas: "
+            + "; ".join(f"{x.get('source')}={x.get('reason')}" for x in source_failures[:5]),
+        )
     return merged
 
 
@@ -3550,6 +3687,7 @@ def run_on_root(
         target = unique_target(path, new_name, output_dir, reserved)
         review_choice = "auto"
         band = _review_band(meta.match_score)
+        failure_review_required = bool(getattr(meta, "source_failures", [])) and band != "auto"
 
         if getattr(args, "review", False) and not should_use_offline and band != "auto":
             reserved.discard(target)
@@ -3568,6 +3706,9 @@ def run_on_root(
         path_resolved = _resolved_path(path)
         target_resolved = _resolved_path(target)
         status = "igual" if target_resolved == path_resolved else "planejado"
+        if failure_review_required and status == "planejado":
+            status = "revisao_necessaria"
+            review_choice = "review_required"
         if review_choice == "skip":
             status = "pulado_revisao"
             new_name = path.name
@@ -3595,6 +3736,7 @@ def run_on_root(
                 "confianca": str(meta.confidence),
                 "pontuacao": str(meta.match_score),
                 "evidencias": json.dumps(meta.evidence or {}, ensure_ascii=False),
+                "source_failures": json.dumps(getattr(meta, "source_failures", []) or [], ensure_ascii=False),
                 "notas": meta.notes,
             }
         )
@@ -3616,6 +3758,7 @@ def run_on_root(
                     "source": meta.source or "",
                     "confidence": meta.confidence,
                     "match_score": meta.match_score,
+                    "source_failures": list(getattr(meta, "source_failures", []) or []),
                 }
             )
 
@@ -3634,6 +3777,7 @@ def run_on_root(
                     "titulo": meta.title,
                     "autores": "; ".join(meta.authors or []),
                     "evidencias": json.dumps(meta.evidence or {}, ensure_ascii=False),
+                    "source_failures": json.dumps(getattr(meta, "source_failures", []) or [], ensure_ascii=False),
                 }
             )
 
@@ -3656,6 +3800,7 @@ def run_on_root(
                     "titulo": meta.title,
                     "autores": "; ".join(meta.authors or []),
                     "fonte": meta.source,
+                    "source_failures": json.dumps(getattr(meta, "source_failures", []) or [], ensure_ascii=False),
                     "notas": meta.notes,
                 }
             )
@@ -3677,6 +3822,7 @@ def run_on_root(
                 "confianca",
                 "pontuacao",
                 "evidencias",
+                "source_failures",
                 "notas",
             ],
         )
@@ -3700,6 +3846,7 @@ def run_on_root(
                     "titulo",
                     "autores",
                     "evidencias",
+                    "source_failures",
                 ],
             )
             rw.writeheader()
@@ -3721,6 +3868,7 @@ def run_on_root(
                     "titulo",
                     "autores",
                     "fonte",
+                    "source_failures",
                     "notas",
                 ],
             )
