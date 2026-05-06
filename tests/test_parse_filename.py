@@ -96,6 +96,44 @@ class TestFailsafePatchMeta:
         assert "marxismo" in (patched.title or "").lower()
 
 
+class TestParseFilenameAlanBarnardStyle:
+    def test_alan_barnard_social_anthropology(self) -> None:
+        m = _fb("Alan Barnard - Social Anthropology and Human Origins.pdf")
+        assert "barnard" in " ".join(m.authors).lower()
+        assert "anthropology" in (m.title or "").lower()
+
+
+class TestAuthorsSuspiciousHeuristic:
+    def test_article_start_fragments_are_suspicious(self) -> None:
+        assert re._authors_look_suspicious(["O gesto e a palavra", "Memória e ritmos"])
+
+    def test_single_real_author_not_suspicious(self) -> None:
+        assert not re._authors_look_suspicious(["Alan Barnard"])
+
+
+class TestFilenameUnderscoreAndLongHyphen:
+    def test_underscore_replaces_colon_before_subtitle(self) -> None:
+        m = _fb("David Harvey – O neoliberalismo_ história e implicações.pdf")
+        assert "harvey" in " ".join(m.authors).lower()
+        assert "neoliberalismo" in (m.title or "").lower()
+
+    def test_underscore_subtitle_before_author_suffix(self) -> None:
+        m = _fb("Art of Game Design_ A Book - Jesse Schell.pdf")
+        assert "schell" in " ".join(m.authors).lower()
+        assert "game design" in (m.title or "").lower()
+
+    def test_underscore_in_subtitle_clark(self) -> None:
+        m = _fb("Andy Clark - Being There_ Putting Brain, Body, and World Together Again.pdf")
+        assert "clark" in " ".join(m.authors).lower()
+        assert "being there" in (m.title or "").lower()
+
+
+class TestSplitAuthorsCommaWithE:
+    def test_hegel_marx_e_tradicao_single_title(self) -> None:
+        parts = re.split_authors("Hegel, Marx e a Tradição Liberal")
+        assert len(parts) == 1
+
+
 class TestDefaultFilenameStem:
     def test_extra_suffix_appended(self) -> None:
         m = re.BookMeta(

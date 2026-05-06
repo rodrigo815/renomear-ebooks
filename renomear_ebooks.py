@@ -204,6 +204,7 @@ BAD_AUTHOR_WORDS = {
     "administrator", "administrador", "admin", "user", "owner", "unknown",
     "scanner", "scan", "converter", "convertido", "icecream", "pdf", "acrobat",
     "adobe", "microsoft", "word", "utilizador", "usuario",
+    "traduzido", "traduzida", "translator", "translation",
 }
 
 BAD_TITLE_WORDS = {
@@ -331,9 +332,73 @@ def _looks_like_internal_id_title(s: str) -> bool:
 
 
 def _normalize_filename_hyphens(s: str) -> str:
-    """Travessao/en-dash (U+2013) e similares -> hifen ASCII para o parse AUTOR - TITULO."""
+    """Travessao/en-dash e similares -> separador forte ' - ' (evita colar AUTOR-TITULO e ligar ao hifen do sobrenome composto ASCII)."""
     s = compact_spaces(s)
-    return compact_spaces(re.sub(r"[\u2013\u2014\u2212\u2010\u2011]", "-", s))
+    s = re.sub(r"\s*[\u2013\u2014\u2212\u2010\u2011]\s*", " - ", s)
+    return compact_spaces(s)
+
+
+def _underscore_subtitle_as_colon(s: str) -> str:
+    """Underscore + espaco costuma substituir ':' ilegal no nome do ficheiro (subtitulo)."""
+    s = compact_spaces(s)
+    return compact_spaces(re.sub(r"(?<=[^\s_])_\s+(?=\S)", ": ", s))
+
+
+def _looks_like_translator_credit(s: str) -> bool:
+    sl = compact_spaces(s).lower()
+    if not sl:
+        return False
+    return bool(
+        re.search(r"\b(?:traduz|translat|revis(?:ao|ão|ões|oes))\w*", sl)
+        or re.search(r"\btrad\.?\b", sl)
+    )
+
+
+def _authors_look_suspicious(authors: list[str] | None) -> bool:
+    """Heuristica: lista de 'autores' parece fragmentos de titulo (parse do ficheiro falhou)."""
+    if not authors:
+        return False
+    au = [compact_spaces(a) for a in authors if compact_spaces(a)]
+    if not au:
+        return False
+    articles = frozenset(
+        {"o", "a", "os", "as", "the", "an", "um", "uma", "uns", "umas", "le", "la", "les", "un"}
+    )
+    for a in au:
+        toks = a.split()
+        if (
+            len(toks) >= 2
+            and toks[0].lower().strip(".'’") in articles
+            and not re.search(r"\b(?:de|da|do|dos|das|del|van|von)\b", toks[0], re.I)
+        ):
+            return True
+    if len(au) >= 4:
+        return True
+    title_like = 0
+    for a in au:
+        al = _segment_author_likelihood(a)
+        tl = _segment_title_likelihood(a)
+        if tl > al + 0.08:
+            title_like += 1
+    if len(au) >= 2 and title_like >= max(1, (len(au) + 1) // 2):
+        return True
+    return False
+
+
+def _remote_bibliographic_trustworthy(remote: BookMeta | None) -> bool:
+    """Registro remoto suficiente para nao acumular mais fontes (ano + titulo + autor legitimo)."""
+    if not remote:
+        return False
+    if not compact_spaces(remote.title or ""):
+        return False
+    if not compact_spaces(remote.year or ""):
+        return False
+    au = remote.authors or []
+    if not au or authors_list_looks_bad(au):
+        return False
+    if _authors_look_suspicious(au):
+        return False
+    return True
 
 
 def authors_list_looks_bad(authors: list[str] | None) -> bool:
@@ -653,7 +718,11 @@ def split_authors(raw: str | list[str] | None) -> list[str]:
         items = raw
     else:
         text = compact_spaces(raw)
-        text = re.sub(r"\s+(?:and|e|&)\s+", ";", text, flags=re.I)
+        if "," not in text:
+            text = re.sub(r"\s+(?:and|e|&)\s+", ";", text, flags=re.I)
+        else:
+            # Virgula + " e " costuma ser titulo ("Hegel, Marx e a Tradicao"), nao lista de autores.
+            text = re.sub(r"\s+(?:and|&)\s+", ";", text, flags=re.I)
         if ";" not in text and "," in text:
             comma_parts = [compact_spaces(p) for p in text.split(",") if compact_spaces(p)]
             # Treat "Nome Sobrenome, Nome Sobrenome" as two authors.
@@ -812,6 +881,8 @@ def _segment_author_likelihood(seg: str) -> float:
         score += 0.34
     if "," in t:
         score += 0.18
+    if wc >= 5 and re.search(r"\b(?:and|e)\b", t, re.I):
+        score -= 0.55
     parts_sa = split_authors(t)
     if len(parts_sa) >= 2:
         score += 0.26
@@ -919,8 +990,9 @@ def _normalize_underscore_separators(s: str) -> str:
 
 
 def _expand_filename_separators_for_bipartite(stem: str) -> str:
-    """Prepara stem: higieniza _/- mistos, depois underscores restantes (Autor/Titulo)."""
+    """Prepara stem: higieniza _/- mistos, dois-pontos via _, depois underscores restantes (Autor/Titulo)."""
     s = _sanitize_mixed_hyphen_underscore(stem)
+    s = _underscore_subtitle_as_colon(s)
     s = _normalize_underscore_separators(s)
     return compact_spaces(s)
 
@@ -1207,9 +1279,16 @@ def read_local_metadata(path: Path, max_pdf_pages: int, year_strategy: str = "or
 
         merged = fallback_authors[:]
         for a in candidate_authors:
+            if _looks_like_translator_credit(a):
+                continue
             na = normalize_for_match(a)
-            if not any(fuzz.token_set_ratio(na, normalize_for_match(b)) >= 90 for b in merged):
-                merged.append(a)
+            if any(fuzz.token_set_ratio(na, normalize_for_match(b)) >= 90 for b in merged):
+                continue
+            if len(fallback_authors) == 1:
+                fb = normalize_for_match(fallback_authors[0])
+                if fb and fuzz.token_set_ratio(na, fb) < 42:
+                    continue
+            merged.append(a)
         merged = dedupe_authors(merged)
         meta.authors = merged or fallback_authors
 
@@ -1831,6 +1910,12 @@ def merge_metadata(
     out = BookMeta(local.path)
     local_authors = local.authors or []
     remote_authors = remote.authors or []
+    force_remote_core = bool(
+        _authors_look_suspicious(local_authors)
+        and remote_authors
+        and not authors_list_looks_bad(remote_authors)
+        and "authors" not in klf
+    )
 
     def local_nonempty_title() -> bool:
         return bool(compact_spaces(local.title or ""))
@@ -1850,17 +1935,22 @@ def merge_metadata(
     elif "title" not in rmf:
         out.title = local.title or remote.title or ""
     else:
-        out.title = (
-            remote.title
-            if prefer_remote_title and remote.title
-            else (local.title or remote.title or "")
-        )
+        if force_remote_core and remote.title:
+            out.title = remote.title
+        else:
+            out.title = (
+                remote.title
+                if prefer_remote_title and remote.title
+                else (local.title or remote.title or "")
+            )
 
     # --- authors ---
     if "authors" in klf:
         out.authors = list(local_authors) if local_authors else list(remote_authors or [])
     elif "authors" not in rmf:
         out.authors = list(local_authors) if local_authors else list(remote_authors or [])
+    elif force_remote_core:
+        out.authors = list(remote_authors)
     elif local_authors and remote_authors and authors_need_enrichment(local_authors):
         if surnames_compatible(local_authors, remote_authors):
             out.authors = list(remote_authors)
@@ -2024,6 +2114,17 @@ def lookup_metadata(
 
     if "openlibrary" in enabled_remote_sources:
         remote = best_openlibrary(meta, cache, sleep_s, year_strategy=year_strategy)
+        if _remote_bibliographic_trustworthy(remote):
+            merged = merge_metadata(
+                meta,
+                remote,
+                prefer_remote_title=prefer_remote_title,
+                remote_merge_fields=remote_merge_fields,
+                keep_local_metadata=keep_local_metadata,
+            )
+            if not skip_author_enrich and authors_need_enrichment(merged.authors):
+                merged.authors = enrich_weak_authors_from_web(merged, cache, sleep_s)
+            return merged
 
     if (not remote or not remote.year) and "google" in enabled_remote_sources:
         gb = best_googlebooks(meta, cache, sleep_s)
