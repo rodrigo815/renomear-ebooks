@@ -128,6 +128,16 @@ class TestFilenameUnderscoreAndLongHyphen:
         assert "being there" in (m.title or "").lower()
 
 
+class TestTrailingParenPublicationYear:
+    def test_year_after_title_in_filename(self) -> None:
+        m = _fb("Yrjö Engeström - Learning by Expanding (1999).pdf")
+        assert m.year == "1999"
+        assert m.filename_paren_year is True
+        assert "expanding" in (m.title or "").lower()
+        assert m.authors
+        assert any("engestr" in a.lower() for a in m.authors)
+
+
 class TestPortalNoiseAndParentheticals:
     def test_strip_zlibrary_and_take_parens_author(self) -> None:
         m = re.parse_filename_fallback(

@@ -229,6 +229,8 @@ class BookMeta:
     evidence: dict[str, str] = field(default_factory=dict)
     # Sufixo de volume/edição extraído do nome (ex.: "Vol.1 3ªed") — sempre no fim do stem.
     filename_extra_suffix: str = ""
+    # Ano extraido de sufixo (AAAA) no fim do stem; prevalece sobre remoto no merge.
+    filename_paren_year: bool = False
 
     def __post_init__(self) -> None:
         if self.authors is None:
@@ -1028,6 +1030,15 @@ def _resolve_two_segments_to_authors_and_title(left: str, right: str) -> tuple[l
     return [], clean_title(compact_spaces(f"{left} - {right}"))
 
 
+def _strip_trailing_paren_publication_year(stem: str) -> tuple[str, str]:
+    """Remove '(1999)' publicacao no fim do stem. 'Autor - Titulo (1999)' -> base + '1999'."""
+    s = compact_spaces(stem)
+    m = re.match(r"^(?P<base>.+?)\s*\((?P<yr>1[4-9]\d{2}|20\d{2})\)\s*$", s)
+    if not m:
+        return s, ""
+    return compact_spaces(m.group("base")), m.group("yr")
+
+
 def _sanitize_mixed_hyphen_underscore(s: str) -> str:
     """Higieniza misturas Karl_Marx_-_O_Capital ou Karl_Marx - O_Capital antes do parse bipartido."""
     s = compact_spaces(_normalize_filename_hyphens(s))
@@ -1079,7 +1090,14 @@ def parse_filename_fallback(path: Path) -> BookMeta:
     stem_raw = _sanitize_filename_stem_noise(stem_raw)
     stem_hyp = _normalize_filename_hyphens(stem_raw)
     stem, file_suffix = strip_trailing_volume_edition_parenthetical(stem_hyp)
-    year = year_from_string(stem) or year_from_string(stem_hyp) or year_from_string(stem_raw)
+    stem, paren_yr = _strip_trailing_paren_publication_year(stem)
+    filename_paren_year = bool(paren_yr)
+    year = (
+        paren_yr
+        or year_from_string(stem)
+        or year_from_string(stem_hyp)
+        or year_from_string(stem_raw)
+    )
     title = stem
     authors: list[str] = []
 
@@ -1099,7 +1117,15 @@ def parse_filename_fallback(path: Path) -> BookMeta:
         year = "" if m.group(2).lower() == "s.d." else m.group(2)
         title = m.group(3)
         return _finish(
-            BookMeta(str(path), clean_title(title), authors, year, source="filename", confidence=0.35)
+            BookMeta(
+                str(path),
+                clean_title(title),
+                authors,
+                year,
+                source="filename",
+                confidence=0.35,
+                filename_paren_year=False,
+            )
         )
 
     m = re.match(r"^((?:1[4-9]\d{2}|20\d{2}))\s+-\s+(.+?)\s+-\s+(.+)$", stem)
@@ -1109,13 +1135,33 @@ def parse_filename_fallback(path: Path) -> BookMeta:
         authors = split_authors(m.group(2))
         title = m.group(3)
         return _finish(
-            BookMeta(str(path), clean_title(title), authors, year, source="filename", confidence=0.35)
+            BookMeta(
+                str(path),
+                clean_title(title),
+                authors,
+                year,
+                source="filename",
+                confidence=0.35,
+                filename_paren_year=False,
+            )
         )
 
     m = re.match(r"^(.+?)\s*\(([^()]+)\)$", stem)
 
     if m:
         inner = compact_spaces(m.group(2))
+        if re.fullmatch(r"(?:1[4-9]\d{2}|20\d{2})", inner):
+            return _finish(
+                BookMeta(
+                    str(path),
+                    clean_title(m.group(1)),
+                    [],
+                    inner,
+                    source="filename",
+                    confidence=0.28,
+                    filename_paren_year=True,
+                )
+            )
         if _parenthetical_is_editorial_note(inner):
             title = stem
             authors = []
@@ -1123,7 +1169,15 @@ def parse_filename_fallback(path: Path) -> BookMeta:
             title = m.group(1)
             authors = split_authors(inner)
         return _finish(
-            BookMeta(str(path), clean_title(title), authors, year, source="filename", confidence=0.25)
+            BookMeta(
+                str(path),
+                clean_title(title),
+                authors,
+                year,
+                source="filename",
+                confidence=0.25,
+                filename_paren_year=filename_paren_year,
+            )
         )
 
     conf_fb = 0.15
@@ -1138,7 +1192,15 @@ def parse_filename_fallback(path: Path) -> BookMeta:
     title = re.sub(r"\b(1[4-9]\d{2}|20\d{2})\b", " ", title)
 
     return _finish(
-        BookMeta(str(path), clean_title(title), authors, year, source="filename", confidence=conf_fb)
+        BookMeta(
+            str(path),
+            clean_title(title),
+            authors,
+            year,
+            source="filename",
+            confidence=conf_fb,
+            filename_paren_year=filename_paren_year,
+        )
     )
 
 
@@ -1169,6 +1231,9 @@ def prioritize_triplet_filename_over_local(local: BookMeta, path: Path) -> BookM
         authors=list(fb.authors) if fb.authors else list(local.authors or []),
         year=fb.year or local.year,
         confidence=max(local.confidence, fb.confidence),
+        filename_paren_year=bool(
+            getattr(fb, "filename_paren_year", False) or getattr(local, "filename_paren_year", False)
+        ),
     )
     append_note(out, "nome em AUTOR-ANO-TITULO: sem busca remota")
     return out
@@ -1392,7 +1457,10 @@ def read_local_metadata(path: Path, max_pdf_pages: int, year_strategy: str = "or
     if not meta.authors:
         meta.authors = fallback.authors
 
-    if not meta.year:
+    if getattr(fallback, "filename_paren_year", False) and compact_spaces(fallback.year or ""):
+        meta.year = fallback.year
+        meta.filename_paren_year = True
+    elif not meta.year:
         meta.year = fallback.year
 
     if not meta.source or meta.source == "unsupported":
@@ -2033,7 +2101,10 @@ def merge_metadata(
     elif "year" not in rmf:
         out.year = local.year or remote.year or ""
     else:
-        out.year = remote.year or local.year or ""
+        if bool(getattr(local, "filename_paren_year", False)) and local_nonempty_year():
+            out.year = local.year
+        else:
+            out.year = remote.year or local.year or ""
 
     # --- isbn ---
     if "isbn" in klf:
@@ -2092,6 +2163,8 @@ def merge_metadata(
     )
     if sfx:
         out.filename_extra_suffix = sfx
+
+    out.filename_paren_year = bool(getattr(local, "filename_paren_year", False))
 
     return out
 
