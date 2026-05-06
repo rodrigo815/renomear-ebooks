@@ -145,6 +145,67 @@ class TestCatalogAuthorLifeDates:
         assert "BUNGE" in out and "Mario" in out
 
 
+class TestYearTokenAndBadAuthor:
+    def test_is_year_token(self) -> None:
+        assert re.is_year_token("1867")
+        assert not re.is_year_token("Marx")
+
+    def test_year_is_bad_author(self) -> None:
+        assert re.author_looks_bad("1867")
+        assert re.author_looks_bad("1917")
+
+
+class TestSplitAuthorsConjunction:
+    def test_split_marx_e_engels(self) -> None:
+        assert re.split_authors("Marx e Engels") == ["Marx", "Engels"]
+
+    def test_split_karl_marx_friedrich_engels(self) -> None:
+        assert re.split_authors("Karl Marx e Friedrich Engels") == ["Karl Marx", "Friedrich Engels"]
+
+    def test_split_marx_and_engels(self) -> None:
+        assert re.split_authors("Marx and Engels") == ["Marx", "Engels"]
+
+    def test_do_not_split_title_crime_e_castigo(self) -> None:
+        assert re.split_authors("Crime e Castigo") == ["Crime e Castigo"]
+
+    def test_do_not_split_title_guerra_e_paz(self) -> None:
+        assert re.split_authors("Guerra e Paz") == ["Guerra e Paz"]
+
+    def test_do_not_split_title_work_and_energy(self) -> None:
+        assert re.split_authors("Work and Energy") == ["Work and Energy"]
+
+
+class TestParentheticalEditorialNotes:
+    def test_2nd_edition(self) -> None:
+        assert re._parenthetical_is_editorial_note("2nd edition")
+
+    def test_book_club_edition(self) -> None:
+        assert re._parenthetical_is_editorial_note("book club edition")
+
+    def test_penguin_classics(self) -> None:
+        assert re._parenthetical_is_editorial_note("Penguin Classics")
+
+    def test_oxford_worlds_classics(self) -> None:
+        assert re._parenthetical_is_editorial_note("Oxford World's Classics")
+
+
+class TestResolveTwoSegmentsGuardrails:
+    def test_marx_o_capital(self) -> None:
+        authors, title = re._resolve_two_segments_to_authors_and_title("Marx", "O Capital")
+        assert authors and "marx" in " ".join(authors).lower()
+        assert "capital" in title.lower()
+
+    def test_lenin_estado_revolucao(self) -> None:
+        authors, title = re._resolve_two_segments_to_authors_and_title("Lenin", "Estado e Revolução")
+        assert authors and "lenin" in " ".join(authors).lower()
+        assert "estado" in title.lower()
+
+    def test_year_left_never_author(self) -> None:
+        authors, title = re._resolve_two_segments_to_authors_and_title("1917", "Estado e Revolução")
+        assert not authors
+        assert "1917" in title
+
+
 class TestTrailingParenPublicationYear:
     def test_year_after_title_in_filename(self) -> None:
         m = _fb("Yrjö Engeström - Learning by Expanding (1999).pdf")

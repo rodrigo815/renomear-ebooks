@@ -276,9 +276,16 @@ def append_note(meta: BookMeta, note: str) -> None:
         meta.notes += f" | {note}"
 
 
+def is_year_token(s: str) -> bool:
+    t = compact_spaces(s)
+    return bool(re.fullmatch(r"(?:1[4-9]\d{2}|20\d{2})", t))
+
+
 def author_looks_bad(author: str) -> bool:
     a = compact_spaces(author)
     if not a:
+        return True
+    if is_year_token(a):
         return True
     if _looks_like_volume_edition_credits(a):
         return True
@@ -393,6 +400,12 @@ def _parenthetical_is_editorial_note(inner: str) -> bool:
         return True
     tl = t.lower()
     if "traduz" in tl or "translat" in tl:
+        return True
+    if re.search(
+        r"\b(?:edition|ed\.?|book club|classics?|cole[cç][aã]o|edi[cç][aã]o)\b",
+        tl,
+        re.I,
+    ):
         return True
     return False
 
@@ -792,11 +805,27 @@ def split_authors(raw: str | list[str] | None) -> list[str]:
         items = raw
     else:
         text = compact_spaces(raw)
+        text = re.sub(r"\s*&\s+", ";", text)
+
+        def _replace_conjunction(m: re.Match[str]) -> str:
+            left = compact_spaces(m.group("left"))
+            right = compact_spaces(m.group("right"))
+            return f"{left}; {right}" if _can_split_author_conjunction(left, right) else m.group(0)
         if "," not in text:
-            text = re.sub(r"\s+(?:and|e|&)\s+", ";", text, flags=re.I)
+            text = re.sub(
+                r"(?P<left>[^;]+?)\s+(?:and|e)\s+(?P<right>[^;]+)",
+                _replace_conjunction,
+                text,
+                flags=re.I,
+            )
         else:
             # Virgula + " e " costuma ser titulo ("Hegel, Marx e a Tradicao"), nao lista de autores.
-            text = re.sub(r"\s+(?:and|&)\s+", ";", text, flags=re.I)
+            text = re.sub(
+                r"(?P<left>[^;]+?)\s+and\s+(?P<right>[^;]+)",
+                _replace_conjunction,
+                text,
+                flags=re.I,
+            )
         if ";" not in text and "," in text:
             comma_parts = [compact_spaces(p) for p in text.split(",") if compact_spaces(p)]
             # Treat "Nome Sobrenome, Nome Sobrenome" as two authors.
@@ -820,6 +849,32 @@ def split_authors(raw: str | list[str] | None) -> list[str]:
             out.append(item)
 
     return out
+
+
+def _can_split_author_conjunction(left: str, right: str) -> bool:
+    l, r = compact_spaces(left), compact_spaces(right)
+    if not l or not r:
+        return False
+    if is_year_token(l) or is_year_token(r):
+        return False
+    if not re.search(r"[A-Za-zÀ-ÿ]", l) or not re.search(r"[A-Za-zÀ-ÿ]", r):
+        return False
+    if _looks_like_volume_edition_credits(l) or _looks_like_volume_edition_credits(r):
+        return False
+    if _parenthetical_is_editorial_note(l) or _parenthetical_is_editorial_note(r):
+        return False
+    lw, rw = len(l.split()), len(r.split())
+    if not (1 <= lw <= 4 and 1 <= rw <= 4):
+        return False
+    strong_mononyms = {"marx", "engels", "lenin", "darwin", "nietzsche"}
+    if lw == 1 and rw == 1:
+        if normalize_for_match(l) not in strong_mononyms or normalize_for_match(r) not in strong_mononyms:
+            return False
+    if _segment_title_likelihood(l) >= 0.55 or _segment_title_likelihood(r) >= 0.55:
+        return False
+    if _segment_author_likelihood(l) < 0.18 or _segment_author_likelihood(r) < 0.18:
+        return False
+    return True
 
 
 def isbn10_valid(s: str) -> bool:
@@ -905,6 +960,12 @@ def _looks_like_volume_edition_credits(s: str) -> bool:
         r"\bed\b", sl, re.I
     ):
         return True
+    if re.search(r"\bbook club(?: edition)?\b", sl, re.I):
+        return True
+    if re.search(r"\b(?:penguin|oxford|signet)\s+.*\bclassics?\b", sl, re.I):
+        return True
+    if re.search(r"\b(?:cole[cç][aã]o|edi[cç][aã]o)\b", sl, re.I):
+        return True
     return False
 
 
@@ -945,6 +1006,8 @@ def _segment_author_likelihood(seg: str) -> float:
     t = compact_spaces(seg)
     if not t:
         return 0.0
+    if is_year_token(t):
+        return 0.0
     wc = len(t.split())
     score = 0.04
     if 1 <= wc <= 10:
@@ -983,6 +1046,8 @@ def _segment_title_likelihood(seg: str) -> float:
     t = compact_spaces(seg)
     if not t:
         return 0.0
+    if is_year_token(t):
+        return 0.0
     wc = len(t.split())
     score = 0.08
     if wc >= 5:
@@ -1009,9 +1074,27 @@ def _resolve_two_segments_to_authors_and_title(left: str, right: str) -> tuple[l
     left, right = compact_spaces(left), compact_spaces(right)
     if not left or not right:
         return [], compact_spaces(f"{left} {right}".strip())
+    if is_year_token(left) or is_year_token(right):
+        return [], clean_title(compact_spaces(f"{left} - {right}"))
 
     la, ra = _segment_author_likelihood(left), _segment_author_likelihood(right)
     lt, rt = _segment_title_likelihood(left), _segment_title_likelihood(right)
+    strong_mononyms = {"marx", "engels", "lenin", "darwin", "nietzsche"}
+    nl, nr = normalize_for_match(left), normalize_for_match(right)
+    if (
+        len(left.split()) == 1
+        and nl in strong_mononyms
+        and re.search(r"[A-Za-zÀ-ÿ]", right)
+        and not author_looks_bad(left)
+    ):
+        return split_authors(left), right
+    if (
+        len(right.split()) == 1
+        and nr in strong_mononyms
+        and re.search(r"[A-Za-zÀ-ÿ]", left)
+        and not author_looks_bad(right)
+    ):
+        return split_authors(right), left
 
     left_is_author = la + rt * 0.55
     right_is_author = ra + lt * 0.55
@@ -1028,13 +1111,19 @@ def _resolve_two_segments_to_authors_and_title(left: str, right: str) -> tuple[l
             return aur if aur else split_authors(right), left
 
     lw, rw = len(left.split()), len(right.split())
-    if lw <= 6 and lw <= rw and re.search(r"[A-Za-zÀ-ÿ]", left):
+    if lw == 1 and not is_year_token(left) and re.search(r"[A-Za-zÀ-ÿ]", left):
+        if rt >= 0.26 and not _looks_like_volume_edition_credits(left) and not author_looks_bad(left):
+            return split_authors(left), right
+    if rw == 1 and not is_year_token(right) and re.search(r"[A-Za-zÀ-ÿ]", right):
+        if lt >= 0.26 and not _looks_like_volume_edition_credits(right) and not author_looks_bad(right):
+            return split_authors(right), left
+    if lw <= 6 and lw <= rw and re.search(r"[A-Za-zÀ-ÿ]", left) and not is_year_token(left):
         return split_authors(left), right
-    if rw <= 6 and rw < lw and re.search(r"[A-Za-zÀ-ÿ]", right):
+    if rw <= 6 and rw < lw and re.search(r"[A-Za-zÀ-ÿ]", right) and not is_year_token(right):
         return split_authors(right), left
-    if lw <= 6 and re.search(r"[A-Za-zÀ-ÿ]", left):
+    if lw <= 6 and re.search(r"[A-Za-zÀ-ÿ]", left) and not is_year_token(left):
         return split_authors(left), right
-    if rw <= 6 and re.search(r"[A-Za-zÀ-ÿ]", right):
+    if rw <= 6 and re.search(r"[A-Za-zÀ-ÿ]", right) and not is_year_token(right):
         return split_authors(right), left
 
     return [], clean_title(compact_spaces(f"{left} - {right}"))
