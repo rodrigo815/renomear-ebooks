@@ -306,6 +306,9 @@ def author_looks_bad(author: str) -> bool:
         return True
     if re.fullmatch(r"[A-Z0-9]{6,}", a):
         return True
+    toks = a.split()
+    if len(toks) >= 4 and re.search(r"\b(?:da|de|do|dos|das|the|of|and|e)\b", a, re.I):
+        return True
     return False
 
 
@@ -1243,6 +1246,26 @@ def parse_filename_fallback(path: Path) -> BookMeta:
                 source="filename",
                 confidence=0.35,
                 filename_paren_year=False,
+            )
+        )
+
+    m = re.match(
+        r"^(.+?)\s*\(([^()]+)\s*\((?:eds?\.?|org\.?|trad\.?)\)\)\s*$",
+        stem,
+        re.I,
+    )
+    if m:
+        title = m.group(1)
+        authors = split_authors(m.group(2))
+        return _finish(
+            BookMeta(
+                str(path),
+                clean_title(title),
+                authors,
+                year,
+                source="filename",
+                confidence=0.27,
+                filename_paren_year=filename_paren_year,
             )
         )
 
@@ -2278,6 +2301,15 @@ def merge_metadata(
         out.authors = list(local_authors) if local_authors else list(remote_authors or [])
     elif force_remote_core:
         out.authors = list(remote_authors)
+    elif (
+        local_authors
+        and remote_authors
+        and not authors_need_enrichment(local_authors)
+        and not authors_list_looks_bad(local_authors)
+        and not surnames_compatible(local_authors, remote_authors)
+    ):
+        out.authors = list(local_authors)
+        append_note(out, "guardrail: autor remoto bloqueado por incompatibilidade com nome local")
     elif local_authors and remote_authors and authors_need_enrichment(local_authors):
         if surnames_compatible(local_authors, remote_authors):
             out.authors = list(remote_authors)
@@ -2295,7 +2327,18 @@ def merge_metadata(
         if bool(getattr(local, "filename_paren_year", False)) and local_nonempty_year():
             out.year = local.year
         else:
-            out.year = remote.year or local.year or ""
+            ry = compact_spaces(remote.year or "")
+            ly = compact_spaces(local.year or "")
+            if ry and ly and is_year_token(ry) and is_year_token(ly):
+                ryi = int(ry)
+                lyi = int(ly)
+                if abs(ryi - lyi) >= 80 or (ryi < 1700 <= lyi):
+                    out.year = ly
+                    append_note(out, f"guardrail: ano remoto outlier ({ry}) ignorado")
+                else:
+                    out.year = ry
+            else:
+                out.year = ry or ly or ""
 
     # --- isbn ---
     if "isbn" in klf:
@@ -2642,6 +2685,8 @@ def title_for_filename(meta: BookMeta) -> str:
 
 def format_one_author(author: str, overrides: dict[str, str]) -> str:
     author = _strip_catalog_author_life_span(compact_spaces(author))
+    author = compact_spaces(re.sub(r"[;:]+", " ", author))
+    author = compact_spaces(re.sub(r"\s*,\s*,+", ", ", author)).strip(" ,;:-")
 
     override = apply_author_overrides(author, overrides)
 

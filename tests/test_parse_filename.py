@@ -239,6 +239,11 @@ class TestFormatRussianStyleInitials:
         out = re.format_one_author("Batischev G. S.", {})
         assert "BATISCHEV" in out and "G." in out
 
+    def test_sanitize_residual_punctuation(self) -> None:
+        out = re.format_one_author("Jameson;, Fredric", {})
+        assert ";" not in out
+        assert "JAMESON" in out
+
 
 class TestSplitAuthorsCommaWithE:
     def test_hegel_marx_e_tradicao_single_title(self) -> None:
@@ -258,3 +263,24 @@ class TestDefaultFilenameStem:
         stem = re.default_filename_stem(m, {}, 3, "sd", unknown_year_label="s.d.")
         assert "Vol" in stem or "vol" in stem.lower()
         assert "2000" in stem
+
+
+class TestMergeGuardrails:
+    def test_remote_incompatible_author_is_blocked(self) -> None:
+        local = re.BookMeta("x.pdf", title="Godless", authors=["Dan Barker"], year="2016", source="filename")
+        remote = re.BookMeta("x.pdf", title="Godless", authors=["Gabriel Bresque"], year="2016", source="googlebooks")
+        merged = re.merge_metadata(local, remote)
+        assert merged.authors == ["Dan Barker"]
+
+    def test_remote_year_outlier_blocked(self) -> None:
+        local = re.BookMeta("x.pdf", title="As Cruzadas", authors=["Amin Maalouf"], year="2010", source="filename")
+        remote = re.BookMeta("x.pdf", title="As Cruzadas", authors=["Amin Maalouf"], year="1601", source="openlibrary")
+        merged = re.merge_metadata(local, remote)
+        assert merged.year == "2010"
+
+
+class TestFallbackNestedEditorialParens:
+    def test_author_from_nested_eds_parenthesis(self) -> None:
+        m = _fb("Freud Evaluated The Completed Arc (Malcolm Macmillan (Eds.)).pdf")
+        assert m.authors
+        assert any("macmillan" in a.lower() for a in m.authors)
