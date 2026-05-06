@@ -1,158 +1,175 @@
-Implemente apenas os patches abaixo no sistema de renomeação de e-books.
+Implemente patches mínimos no arquivo `renomear_ebooks.py`.
 
 Contexto:
-O sistema já está quase finalizado. Não reescreva o fluxo inteiro, não altere a CLI, não mude o formato final dos nomes e não faça refatorações amplas. A tarefa é corrigir heurísticas específicas de detecção de autor/título.
+O script já tem heurísticas maduras para parsing de nome, metadados locais, fontes remotas, scoring e geração de nome. Não reescreva o sistema, não altere CLI, não mude padrão de nomeação, não adicione dependência e não faça refatoração ampla.
 
 Objetivo:
-Reduzir falsos positivos em que partes do título, ano, edição ou informações finais do arquivo são interpretadas como autor.
+Corrigir falsos positivos em que título, ano ou informação editorial são classificados como autor.
+
+Funções diretamente envolvidas:
+- `split_authors`
+- `author_looks_bad`
+- `_parenthetical_is_editorial_note`
+- `_looks_like_volume_edition_credits`
+- `_segment_author_likelihood`
+- `_segment_title_likelihood`
+- `_resolve_two_segments_to_authors_and_title`
 
 Patches obrigatórios:
 
-1. split_authors: tratar "e" / "and" como separador de autores apenas em casos seguros
+1. Ano puro nunca pode ser autor
 
-Hoje já existe lógica para separar autores por vírgula. Estenda a lógica para aceitar também " e " e " and ", mas sem quebrar títulos.
+Adicionar função pequena:
 
-Regras:
-- Separar por "e" / "and" apenas quando os dois lados parecem nomes de autor.
-- Não separar quando um dos lados parece título, subtítulo, editora, série ou expressão longa.
-- Usar limite de palavras por segmento, por exemplo: aceitar mais facilmente segmentos curtos, com 1 a 4 palavras.
-- Evitar separar frases longas.
-- Evitar separar títulos como:
-  - "Crime e Castigo"
-  - "Guerra e Paz"
-  - "O Capital e a Crítica da Economia Política"
-  - "Work and Energy"
-- Separar corretamente autores como:
-  - "Marx e Engels"
-  - "Karl Marx e Friedrich Engels"
-  - "Marx and Engels"
-  - "J. M. Smith and H. C. Van Ness"
-- Preserve a lógica existente com vírgula.
+def is_year_token(s: str) -> bool:
+    ...
 
-Critério:
-"e" / "and" só deve virar ";" quando houver alta confiança de que os dois lados são autores.
+Regra:
 
-2. Parênteses finais: não interpretar edição, book club ou informação editorial como autor
+1846, 1867, 1917, 1975, 2001 nunca devem ser autor.
+Ano pode continuar sendo extraído como ano bibliográfico.
+Ano puro não pode passar como acrônimo, ID curto ou autor monônimo.
 
-Corrija casos em que trecho final entre parênteses é tratado como autor.
+Aplicar em:
 
-Implemente regex ou função pequena para identificar parênteses finais que indicam edição, clube, coleção ou metadado editorial, não autor.
+author_looks_bad
+qualquer ponto em que token curto/acrônimo possa ser promovido a autor, se existir.
+Corrigir split_authors para e / and
 
-Exemplos que devem ser classificados como não-autor:
-- "(edition)"
-- "(2nd edition)"
-- "(3rd ed.)"
-- "(revised edition)"
-- "(book club)"
-- "(book club edition)"
-- "(Penguin Classics)"
-- "(Oxford World's Classics)"
-- "(Signet Classics)"
-- "(Coleção ...)"
-- "(Edição ...)"
+Hoje o script troca e, and e & por ; quando não há vírgula. Isso é agressivo demais.
 
-Regras:
-- Não transformar esse conteúdo em autor.
-- Não remover automaticamente informação relevante do título sem verificar o fluxo atual.
-- Apenas impedir que seja classificado como autor.
-- Preferir função pequena e testável, por exemplo `is_editorial_parenthetical(...)`.
+Alterar para:
 
-3. _resolve_two_segments...: reforçar decisão "1 palavra vs bloco de título" apenas quando o contraste for alto
+manter separação por & como está, se já funciona;
+separar e / and apenas quando os dois lados parecem autores;
+não separar quando os lados parecem título/frase;
+usar funções pequenas auxiliares, se necessário.
 
-Ajuste a heurística de `_resolve_two_segments...` para lidar melhor com casos em que há dois segmentos e um deles tem apenas uma palavra.
+Criar função auxiliar se fizer sentido:
 
-Regras:
-- Se um segmento tem 1 palavra e o outro parece claramente um bloco de título, o segmento de 1 palavra não deve ser promovido automaticamente a autor sem evidência adicional.
-- Aplicar essa regra apenas quando o contraste for alto.
-- Não degradar casos legítimos de autor de uma palavra, como "Marx", "Engels", "Lenin", "Stalin", "Darwin", "Freud", quando o outro segmento for claramente título.
-- Usar sinais combinados:
-  - quantidade de palavras;
-  - capitalização;
-  - presença de stopwords de título;
-  - presença de ano;
-  - presença de termos editoriais;
-  - padrão já existente de autor.
-- Não criar regra agressiva que quebre arquivos simples como:
-  - "Marx - O Capital (1867).pdf"
-  - "Lenin - Estado e Revolução (1917).pdf"
+def _can_split_author_conjunction(left: str, right: str) -> bool:
+    ...
 
-Critério:
-A heurística deve reduzir falsos autores extraídos de títulos, mas preservar autores monônimos conhecidos ou plausíveis.
+Critérios para separar:
 
-4. author_looks_bad + is_acronym_token: bloquear ano puro como autor
+ambos os lados têm texto alfabético;
+ambos os lados têm tamanho plausível de nome;
+nenhum lado é ano puro;
+nenhum lado parece título forte;
+nenhum lado contém metadado editorial;
+aceitar casos como:
+Marx e Engels
+Karl Marx e Friedrich Engels
+Marx and Engels
+J. M. Smith and H. C. Van Ness
 
-Corrija a heurística para impedir que ano puro seja classificado como autor.
+Critérios para NÃO separar:
 
-Regras:
-- Um token composto apenas por ano, como "1846", "1867", "1917", "1975", "2001", nunca deve ser autor.
-- Atualizar `author_looks_bad` e/ou `is_acronym_token` para tratar ano puro como inválido para autor.
-- Não confundir ano com acrônimo.
-- Não permitir que anos de 4 dígitos passem por regra de token curto ou acrônimo.
-- Usar função pequena se fizer sentido, por exemplo `is_year_token(...)`.
+Crime e Castigo
+Guerra e Paz
+Work and Energy
+O Capital e a Crítica da Economia Política
+frases longas ou com cara de título.
 
-Exemplos inválidos como autor:
-- "1846"
-- "1867"
-- "1917"
-- "1975"
-- "2001"
+Importante:
+Não quebrar a lógica existente de vírgula para autores.
 
-Critério:
-Ano pode continuar sendo usado como ano bibliográfico, mas nunca como autor.
+Parênteses finais editoriais não podem virar autor
+
+Ampliar _parenthetical_is_editorial_note e/ou _looks_like_volume_edition_credits.
+
+Casos que devem ser não-autor:
+
+(edition)
+(2nd edition)
+(3rd ed.)
+(revised edition)
+(book club)
+(book club edition)
+(Penguin Classics)
+(Oxford World's Classics)
+(Signet Classics)
+(Coleção ...)
+(Edição ...)
+
+Regra:
+
+Não transformar esse conteúdo em autor.
+Não remover automaticamente o trecho do título se o fluxo atual preserva isso.
+Apenas impedir classificação como autor.
+Ajustar _resolve_two_segments_to_authors_and_title
+
+A função hoje pode promover segmento curto a autor por fallback. Reforçar a regra:
+
+se um lado tem 1 palavra e o outro parece bloco de título, só escolher o lado de 1 palavra como autor quando houver evidência forte;
+preservar autores monônimos plausíveis em casos claros:
+Marx - O Capital
+Lenin - Estado e Revolução
+Darwin - A Origem das Espécies
+Engels - Anti-Dühring
+evitar falso autor quando o segmento de 1 palavra parece ano, edição, coleção, metadado editorial, ID, lixo de arquivo ou fragmento de título.
+
+Não criar lista enorme de autores famosos como solução principal. Se usar lista pequena de sobrenomes fortes, ela deve ser apenas reforço, não única regra.
 
 Testes obrigatórios:
-Adicione ou ajuste testes unitários para cada patch.
+Adicionar testes unitários pequenos, sem chamadas à rede.
 
-Cobrir pelo menos:
-
-split_authors:
-- "Marx e Engels" -> autores separados
-- "Karl Marx e Friedrich Engels" -> autores separados
-- "Marx and Engels" -> autores separados
-- "Crime e Castigo" -> não separar como autores
-- "Guerra e Paz" -> não separar como autores
-- "Work and Energy" -> não separar como autores
-
-Parênteses finais:
-- "(2nd edition)" -> não-autor
-- "(book club edition)" -> não-autor
-- "(Penguin Classics)" -> não-autor
-- preservar comportamento correto de parênteses que já funcionavam
-
-_resolve_two_segments:
-- caso com autor monônimo válido + título deve continuar funcionando
-- caso com 1 palavra suspeita + bloco de título deve evitar falso autor
-- aplicar regra só quando contraste for alto
+Cobrir:
 
 Ano como autor:
-- "1867" não pode ser autor
-- "1917" não pode ser autor
-- ano puro não pode passar como acrônimo
+
+author_looks_bad("1867") is True
+author_looks_bad("1917") is True
+is_year_token("1867") is True
+is_year_token("Marx") is False
+
+split_authors:
+
+split_authors("Marx e Engels") separa autores
+split_authors("Karl Marx e Friedrich Engels") separa autores
+split_authors("Marx and Engels") separa autores
+split_authors("Crime e Castigo") não separa como autores
+split_authors("Guerra e Paz") não separa como autores
+split_authors("Work and Energy") não separa como autores
+
+Parênteses editoriais:
+
+_parenthetical_is_editorial_note("2nd edition") is True
+_parenthetical_is_editorial_note("book club edition") is True
+_parenthetical_is_editorial_note("Penguin Classics") is True
+_parenthetical_is_editorial_note("Oxford World's Classics") is True
+
+Dois segmentos:
+
+_resolve_two_segments_to_authors_and_title("Marx", "O Capital") continua retornando Marx como autor
+_resolve_two_segments_to_authors_and_title("Lenin", "Estado e Revolução") continua retornando Lenin como autor
+caso com segmento suspeito de 1 palavra + bloco de título não deve promover o segmento suspeito a autor
+ano puro em qualquer lado não deve virar autor
 
 Restrições:
-- Não alterar a CLI.
-- Não alterar o padrão final de nomeação.
-- Não adicionar dependência externa.
-- Não refatorar o sistema inteiro.
-- Não mudar comportamento fora desses patches.
-- Não remover heurísticas existentes que estejam funcionando.
-- Manter o menor diff possível.
-- Priorizar funções pequenas e testáveis.
-- Se alguma regra for ambígua, preferir não classificar como autor.
+
+menor diff possível;
+não alterar CLI;
+não alterar padrão final de nomeação;
+não alterar fontes remotas;
+não mexer em cache, HTTP ou README nesta tarefa;
+não refatorar o script inteiro;
+não adicionar dependência;
+não remover heurísticas existentes que funcionam.
 
 Antes de editar:
-1. localize as funções envolvidas: `split_authors`, `_resolve_two_segments...`, `author_looks_bad`, `is_acronym_token` e funções auxiliares relacionadas;
-2. explique rapidamente o comportamento atual;
-3. indique os arquivos que serão alterados;
-4. proponha o patch mínimo;
-5. só então implemente.
+
+mostre o patch plan em até 8 bullets;
+liste as funções que serão tocadas;
+diga quais testes serão adicionados;
+depois implemente somente esses patches.
 
 Ao final:
-- liste os arquivos alterados;
-- explique cada patch aplicado;
-- liste os testes criados ou ajustados;
-- informe como rodar os testes;
-- destaque qualquer ambiguidade restante.
+
+liste arquivos alterados;
+explique cada mudança;
+informe comando para rodar testes;
+destaque qualquer caso ambíguo que ainda deve ir para revisão manual.
 
 ---
 
@@ -416,6 +433,6 @@ Inclua:
 Inclua exemplos reais de comandos.
 
 Exemplo de estrutura:
-```bash
+
 python ebook_renamer.py --dry-run /caminho/para/ebooks
 python ebook_renamer.py /caminho/para/ebooks
