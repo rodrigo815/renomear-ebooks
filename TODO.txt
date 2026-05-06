@@ -1,0 +1,89 @@
+Implemente os seguintes patches:
+
+split_authors: condicionar e / and → ; (já existente lógica com vírgula; estender com “parece título” ou limite de palavras).
+
+Parêntesis finais: marcar edition / book club como não-autor (regex ou função pequena).
+
+_resolve_two_segments…: reforço 1 palavra vs bloco título (só quando contraste alto).
+
+author_looks_bad + is_acronym_token: bloquear ano puro como autor.
+
+---
+
+Implemente tudo a seguir.
+
+Obrigatório no script
+1. timeout
+
+Sim. Toda chamada HTTP precisa de timeout. Sem isso, um arquivo ruim pode travar o renomeador inteiro.
+
+requests.get(url, timeout=10)
+2. user-agent claro
+
+Sim. Para APIs e scraping, use um User-Agent identificável.
+
+HEADERS = {
+    "User-Agent": "ebook-renamer/1.0 (personal metadata lookup)"
+}
+
+Não precisa colocar e-mail se for uso pessoal local, mas para um sistema público/servidor seria melhor.
+
+3. cache
+
+Sim, recomendo fortemente. Não precisa ser sofisticado. Um cache JSON local já basta.
+
+Motivo: se você rodar o script várias vezes na mesma pasta, ele não deve consultar Google Books/Open Library/Crossref cem vezes para o mesmo ISBN ou título.
+
+Exemplo conceitual:
+
+.cache/metadata_lookup.json
+
+Chave:
+
+isbn:9788535909555
+title_author:a ideologia alema|marx
+doi:10.xxxx/yyyy
+4. rate limit básico
+
+Sim, mas simples. Nada de framework.
+
+Algo como:
+
+esperar 0.5s ou 1s entre chamadas para a mesma fonte
+
+Ou limitar por fonte:
+
+OpenLibrary: 1 chamada por segundo
+GoogleBooks: 1 chamada por segundo
+Crossref: 1 chamada por segundo
+
+Isso já evita comportamento agressivo.
+
+Obrigatório apenas se você fizer scraping/crawling de HTML
+5. robots.txt
+
+Só precisa se o script for acessar páginas HTML diretamente com crawler/scraper.
+
+Para APIs públicas, geralmente você segue os termos da API e documentação de rate limit, não robots.txt.
+
+Então:
+
+Usa API pública? Não precisa checar robots.txt.
+Faz scraping de páginas HTML? Precisa respeitar robots.txt.
+
+Em Python, existe urllib.robotparser, mas eu não colocaria isso como primeira prioridade se o sistema usar APIs.
+
+6. termos de uso
+
+Isso não é algo que o script consegue "implementar" perfeitamente. É mais uma regra de projeto.
+
+O que dá para implementar é uma allowlist de fontes permitidas:
+
+ALLOWED_SOURCES = {
+    "openlibrary": True,
+    "google_books": True,
+    "crossref": True,
+    "loc": True,
+    "wikidata": True,
+    "html_scraping": False,
+}
