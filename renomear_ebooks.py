@@ -2859,8 +2859,11 @@ def make_new_filename(
     has_format = bool(re.search(r"%FORMAT%", pattern, flags=re.I))
     stem = _FILENAME_PLACEHOLDER_RE.sub(repl, pattern)
     stem = compact_spaces(stem)
-    if unknown_year == "omit":
-        stem = re.sub(r"\s+-\s+-\s+", " - ", stem)
+    # Quando placeholders ficam vazios, evita artefatos como "- Titulo" ou "Autor -".
+    stem = re.sub(r"\s+-\s+-\s+", " - ", stem)
+    stem = re.sub(r"^\s*-\s*", "", stem)
+    stem = re.sub(r"\s*-\s*$", "", stem)
+    stem = compact_spaces(stem).strip(" -")
     stem = safe_filename_part(stem, max_len=200)
 
     if not stem or stem == "sem_nome":
