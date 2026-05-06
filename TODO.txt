@@ -1,0 +1,7 @@
+TODO - renomear_ebooks
+
+- [x] Atualizar README.md para refletir o comportamento real da CLI.
+- [x] Produzir TECHNICAL_ANALYSIS.md com diagnóstico completo do script.
+- [ ] Revisar manualmente casos com status "revisao_necessaria" no CSV.
+- [ ] Adicionar testes de regressão E2E para `run_on_root` (cenários ambíguos).
+- [ ] Validar fluxo de duplicados (`--find-duplicates` e `--dedup`) com amostra real.
