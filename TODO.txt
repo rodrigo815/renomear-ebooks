@@ -1,89 +1,421 @@
-Implemente os seguintes patches:
+Implemente apenas os patches abaixo no sistema de renomeação de e-books.
 
-split_authors: condicionar e / and → ; (já existente lógica com vírgula; estender com “parece título” ou limite de palavras).
+Contexto:
+O sistema já está quase finalizado. Não reescreva o fluxo inteiro, não altere a CLI, não mude o formato final dos nomes e não faça refatorações amplas. A tarefa é corrigir heurísticas específicas de detecção de autor/título.
 
-Parêntesis finais: marcar edition / book club como não-autor (regex ou função pequena).
+Objetivo:
+Reduzir falsos positivos em que partes do título, ano, edição ou informações finais do arquivo são interpretadas como autor.
 
-_resolve_two_segments…: reforço 1 palavra vs bloco título (só quando contraste alto).
+Patches obrigatórios:
 
-author_looks_bad + is_acronym_token: bloquear ano puro como autor.
+1. split_authors: tratar "e" / "and" como separador de autores apenas em casos seguros
+
+Hoje já existe lógica para separar autores por vírgula. Estenda a lógica para aceitar também " e " e " and ", mas sem quebrar títulos.
+
+Regras:
+- Separar por "e" / "and" apenas quando os dois lados parecem nomes de autor.
+- Não separar quando um dos lados parece título, subtítulo, editora, série ou expressão longa.
+- Usar limite de palavras por segmento, por exemplo: aceitar mais facilmente segmentos curtos, com 1 a 4 palavras.
+- Evitar separar frases longas.
+- Evitar separar títulos como:
+  - "Crime e Castigo"
+  - "Guerra e Paz"
+  - "O Capital e a Crítica da Economia Política"
+  - "Work and Energy"
+- Separar corretamente autores como:
+  - "Marx e Engels"
+  - "Karl Marx e Friedrich Engels"
+  - "Marx and Engels"
+  - "J. M. Smith and H. C. Van Ness"
+- Preserve a lógica existente com vírgula.
+
+Critério:
+"e" / "and" só deve virar ";" quando houver alta confiança de que os dois lados são autores.
+
+2. Parênteses finais: não interpretar edição, book club ou informação editorial como autor
+
+Corrija casos em que trecho final entre parênteses é tratado como autor.
+
+Implemente regex ou função pequena para identificar parênteses finais que indicam edição, clube, coleção ou metadado editorial, não autor.
+
+Exemplos que devem ser classificados como não-autor:
+- "(edition)"
+- "(2nd edition)"
+- "(3rd ed.)"
+- "(revised edition)"
+- "(book club)"
+- "(book club edition)"
+- "(Penguin Classics)"
+- "(Oxford World's Classics)"
+- "(Signet Classics)"
+- "(Coleção ...)"
+- "(Edição ...)"
+
+Regras:
+- Não transformar esse conteúdo em autor.
+- Não remover automaticamente informação relevante do título sem verificar o fluxo atual.
+- Apenas impedir que seja classificado como autor.
+- Preferir função pequena e testável, por exemplo `is_editorial_parenthetical(...)`.
+
+3. _resolve_two_segments...: reforçar decisão "1 palavra vs bloco de título" apenas quando o contraste for alto
+
+Ajuste a heurística de `_resolve_two_segments...` para lidar melhor com casos em que há dois segmentos e um deles tem apenas uma palavra.
+
+Regras:
+- Se um segmento tem 1 palavra e o outro parece claramente um bloco de título, o segmento de 1 palavra não deve ser promovido automaticamente a autor sem evidência adicional.
+- Aplicar essa regra apenas quando o contraste for alto.
+- Não degradar casos legítimos de autor de uma palavra, como "Marx", "Engels", "Lenin", "Stalin", "Darwin", "Freud", quando o outro segmento for claramente título.
+- Usar sinais combinados:
+  - quantidade de palavras;
+  - capitalização;
+  - presença de stopwords de título;
+  - presença de ano;
+  - presença de termos editoriais;
+  - padrão já existente de autor.
+- Não criar regra agressiva que quebre arquivos simples como:
+  - "Marx - O Capital (1867).pdf"
+  - "Lenin - Estado e Revolução (1917).pdf"
+
+Critério:
+A heurística deve reduzir falsos autores extraídos de títulos, mas preservar autores monônimos conhecidos ou plausíveis.
+
+4. author_looks_bad + is_acronym_token: bloquear ano puro como autor
+
+Corrija a heurística para impedir que ano puro seja classificado como autor.
+
+Regras:
+- Um token composto apenas por ano, como "1846", "1867", "1917", "1975", "2001", nunca deve ser autor.
+- Atualizar `author_looks_bad` e/ou `is_acronym_token` para tratar ano puro como inválido para autor.
+- Não confundir ano com acrônimo.
+- Não permitir que anos de 4 dígitos passem por regra de token curto ou acrônimo.
+- Usar função pequena se fizer sentido, por exemplo `is_year_token(...)`.
+
+Exemplos inválidos como autor:
+- "1846"
+- "1867"
+- "1917"
+- "1975"
+- "2001"
+
+Critério:
+Ano pode continuar sendo usado como ano bibliográfico, mas nunca como autor.
+
+Testes obrigatórios:
+Adicione ou ajuste testes unitários para cada patch.
+
+Cobrir pelo menos:
+
+split_authors:
+- "Marx e Engels" -> autores separados
+- "Karl Marx e Friedrich Engels" -> autores separados
+- "Marx and Engels" -> autores separados
+- "Crime e Castigo" -> não separar como autores
+- "Guerra e Paz" -> não separar como autores
+- "Work and Energy" -> não separar como autores
+
+Parênteses finais:
+- "(2nd edition)" -> não-autor
+- "(book club edition)" -> não-autor
+- "(Penguin Classics)" -> não-autor
+- preservar comportamento correto de parênteses que já funcionavam
+
+_resolve_two_segments:
+- caso com autor monônimo válido + título deve continuar funcionando
+- caso com 1 palavra suspeita + bloco de título deve evitar falso autor
+- aplicar regra só quando contraste for alto
+
+Ano como autor:
+- "1867" não pode ser autor
+- "1917" não pode ser autor
+- ano puro não pode passar como acrônimo
+
+Restrições:
+- Não alterar a CLI.
+- Não alterar o padrão final de nomeação.
+- Não adicionar dependência externa.
+- Não refatorar o sistema inteiro.
+- Não mudar comportamento fora desses patches.
+- Não remover heurísticas existentes que estejam funcionando.
+- Manter o menor diff possível.
+- Priorizar funções pequenas e testáveis.
+- Se alguma regra for ambígua, preferir não classificar como autor.
+
+Antes de editar:
+1. localize as funções envolvidas: `split_authors`, `_resolve_two_segments...`, `author_looks_bad`, `is_acronym_token` e funções auxiliares relacionadas;
+2. explique rapidamente o comportamento atual;
+3. indique os arquivos que serão alterados;
+4. proponha o patch mínimo;
+5. só então implemente.
+
+Ao final:
+- liste os arquivos alterados;
+- explique cada patch aplicado;
+- liste os testes criados ou ajustados;
+- informe como rodar os testes;
+- destaque qualquer ambiguidade restante.
 
 ---
 
-Implemente tudo a seguir.
+Acrescente uma regra de tolerância a falhas para consultas externas.
 
-Obrigatório no script
-1. timeout
+Objetivo:
+Se uma fonte externa falhar, o sistema não deve travar o processo inteiro de renomeação. A falha deve afetar apenas aquela fonte e aquele candidato, sem impedir que o arquivo seja analisado por outras fontes ou heurísticas.
 
-Sim. Toda chamada HTTP precisa de timeout. Sem isso, um arquivo ruim pode travar o renomeador inteiro.
+Regra obrigatória:
+Quando uma fonte externa falhar, o sistema deve:
 
-requests.get(url, timeout=10)
-2. user-agent claro
+1. registrar a falha da fonte;
+2. indicar qual fonte falhou;
+3. indicar, quando possível, o motivo da falha;
+4. continuar consultando as demais fontes disponíveis;
+5. reduzir a confiança do candidato afetado, se ele dependia daquela fonte;
+6. não descartar automaticamente informações já obtidas de outras fontes;
+7. não renomear automaticamente se a falha deixar a confiança abaixo do limite seguro;
+8. marcar o arquivo para revisão manual quando a decisão ficar ambígua;
+9. não interromper o processamento dos demais arquivos.
 
-Sim. Para APIs e scraping, use um User-Agent identificável.
+Tipos de falha a tratar:
+- timeout;
+- erro de conexão;
+- resposta HTTP 429;
+- resposta HTTP 500, 502, 503 ou 504;
+- resposta inválida;
+- JSON malformado;
+- campo esperado ausente;
+- fonte temporariamente indisponível;
+- limite de requisições atingido.
 
-HEADERS = {
-    "User-Agent": "ebook-renamer/1.0 (personal metadata lookup)"
-}
+Comportamento esperado:
+- falha em Open Library não deve impedir consulta ao Google Books, Crossref ou outras fontes;
+- falha em Google Books não deve impedir uso de metadados internos, nome do arquivo, ISBN, DOI ou outras fontes;
+- falha em uma fonte não deve encerrar o script;
+- falha em um arquivo não deve interromper o lote inteiro;
+- o relatório final deve mostrar a falha da fonte e a decisão tomada.
 
-Não precisa colocar e-mail se for uso pessoal local, mas para um sistema público/servidor seria melhor.
+Exemplo de relatório por arquivo:
 
-3. cache
+source_failures:
+  - source: openlibrary
+    reason: timeout
+    action: ignored_source_and_continued
+confidence_adjustment:
+  previous_score: 0.82
+  final_score: 0.68
+  reason: external_source_unavailable
+action: review_required
 
-Sim, recomendo fortemente. Não precisa ser sofisticado. Um cache JSON local já basta.
+Regras de implementação:
 
-Motivo: se você rodar o script várias vezes na mesma pasta, ele não deve consultar Google Books/Open Library/Crossref cem vezes para o mesmo ISBN ou título.
+centralizar tratamento de falhas no cliente HTTP ou na camada de consulta externa;
+não espalhar try/except genérico pelo código inteiro;
+não usar except Exception: pass;
+não esconder erro silenciosamente;
+não transformar falha externa em metadado vazio sem registrar motivo;
+usar erro estruturado ou objeto de resultado quando fizer sentido;
+preservar o fluxo atual do script;
+manter menor diff possível;
+adicionar testes unitários com mocks para fontes externas falhando.
 
-Exemplo conceitual:
+Testes obrigatórios:
 
-.cache/metadata_lookup.json
+uma fonte falha por timeout e as demais continuam;
+uma fonte retorna HTTP 500 e o script continua;
+uma fonte retorna JSON inválido e o erro é registrado;
+todas as fontes externas falham e o arquivo é marcado como revisão manual ou skipped;
+falha em um arquivo não interrompe processamento dos demais;
+confiança é reduzida quando uma fonte relevante falha;
+o sistema não renomeia automaticamente quando a confiança final fica baixa.
 
-Chave:
+Restrições:
 
-isbn:9788535909555
-title_author:a ideologia alema|marx
-doi:10.xxxx/yyyy
-4. rate limit básico
+não alterar CLI;
+não alterar padrão final de nomeação;
+não adicionar dependência externa sem necessidade;
+não reescrever o sistema de consulta externa;
+não implementar crawler novo;
+não mascarar erro;
+não travar o renomeador inteiro por falha de fonte externa.
 
-Sim, mas simples. Nada de framework.
+Antes de editar:
 
-Algo como:
+localize onde as fontes externas são chamadas;
+localize onde o score/confiança é calculado;
+localize onde o relatório por arquivo é montado;
+proponha o patch mínimo;
+indique os testes que serão criados.
 
-esperar 0.5s ou 1s entre chamadas para a mesma fonte
+Ao final:
 
-Ou limitar por fonte:
+liste arquivos alterados;
+explique como cada tipo de falha é tratado;
+liste os testes adicionados;
+informe como rodar os testes;
+destaque qualquer limitação restante.
 
-OpenLibrary: 1 chamada por segundo
-GoogleBooks: 1 chamada por segundo
-Crossref: 1 chamada por segundo
+---
 
-Isso já evita comportamento agressivo.
+Ajuste o README e faça uma análise técnica aprofundada do script inteiro.
 
-Obrigatório apenas se você fizer scraping/crawling de HTML
-5. robots.txt
+Contexto:
+Este projeto é um renomeador de e-books em Python. Ele trabalha com arquivos como PDF, EPUB, MOBI, AZW3 e similares, extraindo ou inferindo autor, título e ano a partir do nome do arquivo, metadados internos e, quando disponível, consultas externas.
 
-Só precisa se o script for acessar páginas HTML diretamente com crawler/scraper.
+O script já está quase finalizado. A tarefa agora não é reescrever o sistema, mas revisar a documentação e produzir uma análise técnica séria do estado atual.
 
-Para APIs públicas, geralmente você segue os termos da API e documentação de rate limit, não robots.txt.
+Objetivos:
 
-Então:
+1. Atualizar o README para refletir corretamente o funcionamento real do script.
+2. Explicar como instalar, configurar e executar o programa.
+3. Documentar os modos de uso, flags, formato de saída, dry-run, cache, logs e comportamento de segurança.
+4. Fazer uma análise aprofundada do script inteiro, identificando pontos fortes, riscos, limitações e possíveis melhorias.
+5. Não implementar refatorações amplas sem autorização.
 
-Usa API pública? Não precisa checar robots.txt.
-Faz scraping de páginas HTML? Precisa respeitar robots.txt.
+Antes de alterar o README:
+- leia o script principal inteiro;
+- leia arquivos auxiliares, se existirem;
+- leia testes existentes, se existirem;
+- identifique a CLI real;
+- identifique dependências reais;
+- identifique formatos suportados;
+- identifique como o script decide autor, título e ano;
+- identifique como o script evita renomeação errada;
+- identifique como funciona dry-run, cache, logs e tratamento de conflitos;
+- identifique limitações atuais.
 
-Em Python, existe urllib.robotparser, mas eu não colocaria isso como primeira prioridade se o sistema usar APIs.
+Tarefa 1: análise aprofundada do script
 
-6. termos de uso
+Produza uma análise com as seguintes seções:
 
-Isso não é algo que o script consegue "implementar" perfeitamente. É mais uma regra de projeto.
+1. Visão geral
+- o que o script faz;
+- quais problemas resolve;
+- quais formatos suporta;
+- qual é o fluxo principal.
 
-O que dá para implementar é uma allowlist de fontes permitidas:
+2. Fluxo de execução
+Explique o fluxo real do programa:
+- entrada dos arquivos;
+- leitura de metadados;
+- parsing do nome;
+- consulta externa, se houver;
+- scoring/confiança;
+- geração do nome final;
+- dry-run;
+- renomeação física;
+- relatório/log.
 
-ALLOWED_SOURCES = {
-    "openlibrary": True,
-    "google_books": True,
-    "crossref": True,
-    "loc": True,
-    "wikidata": True,
-    "html_scraping": False,
-}
+3. Arquitetura do script
+Descreva:
+- principais funções;
+- responsabilidades de cada função;
+- pontos de acoplamento;
+- funções que estão grandes demais;
+- funções que misturam responsabilidades;
+- dependências externas;
+- partes testáveis e partes difíceis de testar.
+
+4. Heurísticas bibliográficas
+Analise como o script trata:
+- autores múltiplos;
+- separadores como vírgula, "e" e "and";
+- título vs autor;
+- ano;
+- ISBN;
+- DOI, se houver;
+- metadados ruins;
+- parênteses editoriais;
+- edições, coleções e book club;
+- autores monônimos;
+- acrônimos;
+- casos ambíguos.
+
+5. Segurança operacional
+Verifique se o script:
+- preserva extensão original;
+- evita sobrescrever arquivos;
+- possui dry-run;
+- registra nome antigo e novo;
+- lida com conflitos de nome;
+- lida com erro sem travar tudo;
+- evita renomear quando a confiança é baixa;
+- permite revisão manual em casos ambíguos.
+
+6. Chamadas externas
+Se houver consultas externas, analise:
+- quais fontes são usadas;
+- se há timeout;
+- se há user-agent;
+- se há cache;
+- se há rate limit;
+- se há retry com backoff;
+- se falha externa derruba ou não o processo;
+- se scraping HTML está desligado por padrão.
+
+7. Testes
+Analise:
+- cobertura atual;
+- quais funções estão bem testadas;
+- quais heurísticas precisam de teste;
+- quais casos de regressão faltam;
+- quais testes devem ser adicionados antes de novas mudanças.
+
+8. Qualidade do código
+Procure:
+- nomes genéricos;
+- funções longas;
+- comentários óbvios;
+- duplicação;
+- tratamento genérico de erro;
+- dependências desnecessárias;
+- classes artificiais;
+- lógica no escopo global;
+- código difícil de testar;
+- sinais de overengineering;
+- sinais de estética "AI-generated".
+
+9. Riscos e limitações
+Liste:
+- riscos de renomeação errada;
+- fontes de falso autor;
+- fontes de falso título;
+- problemas com ano;
+- problemas com edições/traduções;
+- limitações com metadados ruins;
+- casos em que o sistema deve preferir revisão manual.
+
+10. Melhorias recomendadas
+Classifique as melhorias em:
+- obrigatórias;
+- recomendadas;
+- opcionais;
+- evitar por enquanto.
+
+Não implemente essas melhorias automaticamente. Apenas liste, salvo se forem mudanças pequenas no README.
+
+Tarefa 2: ajuste do README
+
+Atualize o README com base no comportamento real do script.
+
+O README deve conter:
+
+1. Nome e descrição curta
+Explique em poucas linhas o que o script faz.
+
+2. Funcionalidades
+Liste funcionalidades reais, sem prometer o que não existe.
+
+3. Formatos suportados
+Liste os formatos suportados de fato pelo código.
+
+4. Instalação
+Inclua:
+- versão de Python necessária;
+- criação de ambiente virtual, se aplicável;
+- instalação de dependências.
+
+5. Uso básico
+Inclua exemplos reais de comandos.
+
+Exemplo de estrutura:
+```bash
+python ebook_renamer.py --dry-run /caminho/para/ebooks
+python ebook_renamer.py /caminho/para/ebooks
