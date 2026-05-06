@@ -128,6 +128,30 @@ class TestFilenameUnderscoreAndLongHyphen:
         assert "being there" in (m.title or "").lower()
 
 
+class TestPortalNoiseAndParentheticals:
+    def test_strip_zlibrary_and_take_parens_author(self) -> None:
+        m = re.parse_filename_fallback(
+            Path("As Cruzadas (Amin Maalouf) (z-library.sk, 1lib.sk, z-lib.sk).pdf")
+        )
+        assert any("maalouf" in a.lower() for a in (m.authors or []))
+
+    def test_cia_registry_tail_removed(self) -> None:
+        m = re.parse_filename_fallback(
+            Path("CIA Information Report - Stalin leadership - CIA-RDP80-00810A006000360009-0.pdf")
+        )
+        assert m.title is not None and "CIA-RDP" not in m.title
+
+    def test_traduzido_in_parens_is_not_lone_author(self) -> None:
+        m = re.parse_filename_fallback(Path("Godless (Traduzido).pdf"))
+        assert not m.authors
+
+
+class TestFormatRussianStyleInitials:
+    def test_batischev_g_s(self) -> None:
+        out = re.format_one_author("Batischev G. S.", {})
+        assert "BATISCHEV" in out and "G." in out
+
+
 class TestSplitAuthorsCommaWithE:
     def test_hegel_marx_e_tradicao_single_title(self) -> None:
         parts = re.split_authors("Hegel, Marx e a Tradição Liberal")

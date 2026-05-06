@@ -280,6 +280,12 @@ def author_looks_bad(author: str) -> bool:
         return True
     if _looks_like_volume_edition_credits(a):
         return True
+    if re.search(
+        r"z-library|z-lib\.|1lib\.sk|singlelogin|librarylol|b-ok\.|zlib\.",
+        a,
+        re.I,
+    ):
+        return True
     n = normalize_for_match(a)
     words = set(n.split())
     if words & BAD_AUTHOR_WORDS:
@@ -342,6 +348,62 @@ def _underscore_subtitle_as_colon(s: str) -> str:
     """Underscore + espaco costuma substituir ':' ilegal no nome do ficheiro (subtitulo)."""
     s = compact_spaces(s)
     return compact_spaces(re.sub(r"(?<=[^\s_])_\s+(?=\S)", ": ", s))
+
+
+_PORTAL_SUFFIX_RE = re.compile(
+    r"\s*\([^)]*(?:z-library|z-lib\.|1lib\.sk|singlelogin|librarylol|b-ok\.|zlib\.)[^)]*\)",
+    re.I,
+)
+
+_CIA_REGISTRY_TAIL_RE = re.compile(
+    r"\s+-\s+CIA-RDP[0-9A-Z][0-9A-Z\-]{6,}\s*$",
+    re.I,
+)
+
+
+def _sanitize_filename_stem_noise(st: str) -> str:
+    """Remove sufixos de portal (Z-Library etc.) e referencias CIA-RDP do stem antes do parse."""
+    s = compact_spaces(st)
+    while True:
+        prev = s
+        s = _PORTAL_SUFFIX_RE.sub("", s)
+        s = compact_spaces(s)
+        if s == prev:
+            break
+    s = _CIA_REGISTRY_TAIL_RE.sub("", s)
+    return compact_spaces(s)
+
+
+_EDITORIAL_PAREN_RE = re.compile(
+    r"^(traduzid[oa]|translated?|obras?|scanned?|scan|ocr|illustr|abrev|compil|org\.?|ed\.)\w*$",
+    re.I,
+)
+
+
+def _parenthetical_is_editorial_note(inner: str) -> bool:
+    """Conteudo entre parenteses que nao e nome de pessoa (traduzido, OCR, etc.)."""
+    t = compact_spaces(inner)
+    if not t:
+        return True
+    if _EDITORIAL_PAREN_RE.match(t):
+        return True
+    if author_looks_bad(t):
+        return True
+    tl = t.lower()
+    if "traduz" in tl or "translat" in tl:
+        return True
+    return False
+
+
+def _count_trailing_name_initials(tokens: list[str]) -> int:
+    """Tokens finais tipo 'G.' ou 'S.' (iniciais de nome russo/tecnicas)."""
+    n = 0
+    for i in range(len(tokens) - 1, -1, -1):
+        if re.fullmatch(r"[A-ZÀ-Ý]\.", tokens[i], re.I):
+            n += 1
+        else:
+            break
+    return n
 
 
 def _looks_like_translator_credit(s: str) -> bool:
@@ -1014,6 +1076,7 @@ def _bipartite_split_once(stem: str) -> tuple[str, str] | None:
 
 def parse_filename_fallback(path: Path) -> BookMeta:
     stem_raw = compact_spaces(path.stem)
+    stem_raw = _sanitize_filename_stem_noise(stem_raw)
     stem_hyp = _normalize_filename_hyphens(stem_raw)
     stem, file_suffix = strip_trailing_volume_edition_parenthetical(stem_hyp)
     year = year_from_string(stem) or year_from_string(stem_hyp) or year_from_string(stem_raw)
@@ -1052,8 +1115,13 @@ def parse_filename_fallback(path: Path) -> BookMeta:
     m = re.match(r"^(.+?)\s*\(([^()]+)\)$", stem)
 
     if m:
-        title = m.group(1)
-        authors = split_authors(m.group(2))
+        inner = compact_spaces(m.group(2))
+        if _parenthetical_is_editorial_note(inner):
+            title = stem
+            authors = []
+        else:
+            title = m.group(1)
+            authors = split_authors(inner)
         return _finish(
             BookMeta(str(path), clean_title(title), authors, year, source="filename", confidence=0.25)
         )
@@ -2099,6 +2167,28 @@ def compute_match_evidence(local: BookMeta, merged: BookMeta) -> tuple[int, dict
     return score, ev
 
 
+def _recover_authors_from_google_by_title(
+    merged: BookMeta,
+    enabled_remote_sources: frozenset[str],
+    cache: dict[str, Any],
+    sleep_s: float,
+) -> BookMeta:
+    """Quando nao ha autor utilizavel mas ha titulo, tenta Google Books so com titulo."""
+    if merged.authors and not authors_list_looks_bad(merged.authors):
+        return merged
+    if not compact_spaces(merged.title or ""):
+        return merged
+    if "google" not in enabled_remote_sources:
+        return merged
+    probe = replace(merged, authors=[])
+    gb = best_googlebooks(probe, cache, sleep_s)
+    if gb and gb.authors and not authors_list_looks_bad(gb.authors):
+        out = replace(merged, authors=list(gb.authors))
+        append_note(out, "autor recuperado via Google Books (busca por titulo)")
+        return out
+    return merged
+
+
 def lookup_metadata(
     meta: BookMeta,
     enabled_remote_sources: frozenset[str],
@@ -2124,6 +2214,9 @@ def lookup_metadata(
             )
             if not skip_author_enrich and authors_need_enrichment(merged.authors):
                 merged.authors = enrich_weak_authors_from_web(merged, cache, sleep_s)
+            merged = _recover_authors_from_google_by_title(
+                merged, enabled_remote_sources, cache, sleep_s
+            )
             return merged
 
     if (not remote or not remote.year) and "google" in enabled_remote_sources:
@@ -2184,6 +2277,7 @@ def lookup_metadata(
     )
     if not skip_author_enrich and authors_need_enrichment(merged.authors):
         merged.authors = enrich_weak_authors_from_web(merged, cache, sleep_s)
+    merged = _recover_authors_from_google_by_title(merged, enabled_remote_sources, cache, sleep_s)
     return merged
 
 
@@ -2204,6 +2298,39 @@ def apply_author_overrides(author: str, overrides: dict[str, str]) -> str | None
     return None
 
 
+def _sanitize_author_list(authors: list[str] | None) -> list[str]:
+    if not authors:
+        return []
+    return [a for a in authors if compact_spaces(a) and not author_looks_bad(a)]
+
+
+def authors_for_output(meta: BookMeta) -> list[str]:
+    raw = _sanitize_author_list(meta.authors)
+    if raw:
+        return dedupe_authors(raw)
+    if not meta.path:
+        return []
+    fb = parse_filename_fallback(Path(meta.path))
+    return dedupe_authors(_sanitize_author_list(fb.authors))
+
+
+def title_for_filename(meta: BookMeta) -> str:
+    p = Path(meta.path)
+    t = compact_spaces(meta.title or "")
+    fb = parse_filename_fallback(p)
+    aus = authors_for_output(meta)
+    if aus and t:
+        joined = normalize_for_match(" ".join(aus))
+        nt = normalize_for_match(t)
+        if nt and joined and fuzz.token_set_ratio(nt, joined) >= 78:
+            fb_t = compact_spaces(fb.title or "")
+            if fb_t:
+                t = fb_t
+    if not t:
+        t = compact_spaces(fb.title or "") or p.stem
+    return compact_spaces(t)
+
+
 def format_one_author(author: str, overrides: dict[str, str]) -> str:
     author = compact_spaces(author)
 
@@ -2220,6 +2347,13 @@ def format_one_author(author: str, overrides: dict[str, str]) -> str:
 
     if not tokens:
         return ""
+
+    ni = _count_trailing_name_initials(tokens)
+    if 1 <= ni <= 4 and len(tokens) >= 2 and ni == len(tokens) - 1:
+        surname = " ".join(tokens[:-ni])
+        given = " ".join(tokens[-ni:])
+        if compact_spaces(surname):
+            return f"{surname.upper()}, {given}"
 
     author_lower = normalize_for_match(author)
 
@@ -2285,8 +2419,10 @@ def default_filename_stem(
     unknown_year_label: str = "s.d.",
 ) -> str:
     """Parte do nome sem extensao no padrao historico: AUTOR - ANO - TITULO."""
-    title = safe_filename_part(meta.title or Path(meta.path).stem, max_len=120)
-    author_part = safe_filename_part(format_authors(meta.authors or [], overrides, max_authors), max_len=90)
+    tit = title_for_filename(meta)
+    title = safe_filename_part(tit or Path(meta.path).stem, max_len=120)
+    afmt = format_authors(authors_for_output(meta), overrides, max_authors)
+    author_part = safe_filename_part(afmt, max_len=90) if afmt else ""
     year = meta.year or unknown_year_placeholder(unknown_year, unknown_year_label)
 
     if author_part and year:
@@ -2342,15 +2478,13 @@ def make_new_filename(
             + ext_l
         )
 
-    author_fmt = safe_filename_part(
-        format_authors(meta.authors or [], overrides, max_authors),
-        max_len=120,
-    )
+    afmt = format_authors(authors_for_output(meta), overrides, max_authors)
+    author_fmt = safe_filename_part(afmt, max_len=120) if afmt else ""
     if unknown_year == "sd":
         date_fmt = meta.year or unknown_year_placeholder(unknown_year, unknown_year_label)
     else:
         date_fmt = meta.year or ""
-    title_fmt = safe_filename_part(meta.title or Path(meta.path).stem, max_len=140)
+    title_fmt = safe_filename_part(title_for_filename(meta), max_len=140)
     publisher_fmt = safe_filename_part(meta.publisher or "", max_len=100)
     format_fmt = ext_l
 
@@ -3135,7 +3269,7 @@ def interactive_review_item(
             if lk is not None and local.authors:
                 a0 = local.authors[0]
                 lk[a0] = "; ".join(
-                    format_authors(meta.authors or [], overrides, max_authors)
+                    format_authors(authors_for_output(meta), overrides, max_authors)
                 )
             tgt = unique_target(path, proposed_name, output_dir, reserved)
             return proposed_name, tgt, "always_author"
