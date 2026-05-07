@@ -499,6 +499,18 @@ def authors_list_looks_bad(authors: list[str] | None) -> bool:
 
 
 def dedupe_authors(authors: list[str]) -> list[str]:
+    def _author_sig(a: str) -> tuple[str, str]:
+        toks = normalize_for_match(a).split()
+        if not toks:
+            return "", ""
+        surname = toks[-1]
+        first = toks[0][0] if toks and toks[0] else ""
+        return surname, first
+
+    def _author_richness(a: str) -> tuple[int, int]:
+        toks = normalize_for_match(a).split()
+        return (len(toks), len("".join(toks)))
+
     out: list[str] = []
     norms: list[str] = []
     for a in authors:
@@ -508,7 +520,21 @@ def dedupe_authors(authors: list[str]) -> list[str]:
         n = normalize_for_match(a)
         if not n:
             continue
-        if any(fuzz.token_set_ratio(n, prev) >= 94 for prev in norms):
+        sig = _author_sig(a)
+        replaced = False
+        for i, prev in enumerate(out):
+            pnorm = norms[i]
+            if fuzz.token_set_ratio(n, pnorm) >= 94:
+                replaced = True
+                break
+            psig = _author_sig(prev)
+            if sig[0] and sig[0] == psig[0] and sig[1] and sig[1] == psig[1]:
+                if _author_richness(a) > _author_richness(prev):
+                    out[i] = a
+                    norms[i] = n
+                replaced = True
+                break
+        if replaced:
             continue
         out.append(a)
         norms.append(n)
@@ -857,7 +883,25 @@ def split_authors(raw: str | list[str] | None) -> list[str]:
 
     out = []
 
+    expanded_items: list[str] = []
     for item in items:
+        ci = compact_spaces(item)
+        if not ci:
+            continue
+        # Lista mista: "A, B" (nome completo, nao formato SOBRENOME, Nome) -> separa autores.
+        if "," in ci and ";" not in ci:
+            comma_parts = [compact_spaces(p) for p in ci.split(",") if compact_spaces(p)]
+            if (
+                len(comma_parts) == 2
+                and all(len(p.split()) >= 2 for p in comma_parts)
+                and not comma_parts[0].isupper()
+                and not re.match(r"^[A-ZÀ-Ý][A-ZÀ-Ý'’\-]+$", comma_parts[0])
+            ):
+                expanded_items.extend(comma_parts)
+                continue
+        expanded_items.append(ci)
+
+    for item in expanded_items:
         item = _strip_catalog_author_life_span(compact_spaces(item))
         if item and item not in out:
             out.append(item)

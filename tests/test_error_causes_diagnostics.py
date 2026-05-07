@@ -65,12 +65,38 @@ def test_c4_regression_duplicate_author_variants_should_collapse() -> None:
     )
     names = " ; ".join(merged.authors or [])
     assert names.count("Atkins") <= 1
+    assert "Peter" in names or "P. W." in names
+
+
+def test_c4_regression_duplicate_medeiros_variants_should_collapse() -> None:
+    merged = re.merge_metadata(
+        re.BookMeta(
+            "x.pdf",
+            title="Nietzsche e o Socialismo",
+            authors=["R. Medeiros"],
+            year="",
+        ),
+        re.BookMeta(
+            "x.pdf",
+            title="Nietzsche e o Socialismo",
+            authors=["Rodolfo Medeiros"],
+            year="2020",
+        ),
+    )
+    names = merged.authors or []
+    assert len(names) == 1
+    assert "medeiros" in names[0].lower()
 
 
 def test_c6_regression_periodical_should_not_force_person_author() -> None:
     m = _fb("Soviet Cybernetics Review - Vol. 4 no1.pdf")
     assert not m.authors
     assert "review" in (m.title or "").lower()
+
+
+def test_c4_regression_comma_ampersand_multi_author_splits_correctly() -> None:
+    parts = re.split_authors("James F. Kasting, Robert G. Crane & Lee R. Kump")
+    assert parts == ["James F. Kasting", "Robert G. Crane", "Lee R. Kump"]
 
 
 def test_c5_regression_where_human_rights_should_recover_author(monkeypatch) -> None:  # noqa: ANN001

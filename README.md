@@ -156,6 +156,57 @@ python renomear_ebooks.py "E:\Livros" --exts "pdf,epub,.mobi"
 
 Use `python renomear_ebooks.py --help` para referencia completa e exemplos atualizados da CLI.
 
+## Referencia de flags (comportamento de cada uma)
+
+- `PASTA` (argumento posicional): uma ou mais pastas de entrada; sem `--recursive` processa so o nivel imediato.
+- `--apply`: aplica renomeacao/movimentacao fisica (sem esta flag, fica em simulacao).
+- `--review`: revisao interativa para casos nao automaticos; gera `review_needed.csv`; incompativel com `--apply`.
+- `--recursive`: inclui subpastas na varredura.
+- `--exts EXTS`: filtra extensoes permitidas (CSV; com ou sem ponto), ex.: `pdf,epub,.mobi`.
+- `--source`: seleciona estrategia de fonte remota (`offline`, `openlibrary`, `google`, `skoob`, `catalogs`, `wikipedia`, `web`, `all`).
+- `--sources LISTA`: restringe fontes quando `--source all` (ex.: `openlibrary,google,wikipedia`); tem precedencia sobre velocidade.
+- `--prefer-remote-title`: prefere titulo remoto no merge quando houver.
+- `--remote-metadata CAMPOS`: define quais campos podem ser atualizados pelo remoto (`title,authors,year,isbn,publisher`).
+- `--keep-local-metadata CAMPOS`: define campos que devem manter valor local quando preenchidos.
+- `--max-authors N`: limita autores no nome final; acima do limite vira `et al.`; `0` mostra todos.
+- `--unknown-year sd|omit`: com ano ausente, usa placeholder (`sd`) ou remove bloco de data (`omit`).
+- `--omit-date-if-missing`: atalho para comportamento de `--unknown-year omit`.
+- `--unknown-year-text TEXTO`: texto do placeholder de ano quando `sd` (padrao `s.d.`).
+- `--filename-pattern PADRAO`: padrao customizado com `%AUTHOR% %DATE% %TITLE% %PUBLISHER% %FORMAT%`.
+- `--year-strategy original|edition`: criterio para escolher ano entre candidatos (mais antigo ou mais recente).
+- `--max-pdf-pages N`: numero maximo de paginas lidas no PDF para inferencia local.
+- `--sleep SEG`: pausa entre requests HTTP.
+- `--fast`: perfil rapido (menos rede, menos leitura de PDF); incompativel com `--thorough` e `--search-speed`.
+- `--thorough`: perfil mais completo (mais rede e leitura de PDF); incompativel com `--fast` e `--search-speed`.
+- `--search-speed N`: velocidade de busca remota (1 a 5); incompativel com `--fast` e `--thorough`.
+- `--overrides ARQUIVO`: caminho do JSON de sobrescrita de autores (padrao `author_overrides.json` na pasta alvo).
+- `--supplementary-data ARQUIVO`: metadado adicional por arquivo (`.json`, `.csv` ou `.txt` TSV).
+- `--supplementary-mode merge|override`: modo de aplicacao do metadado suplementar.
+- `--missing-year-log [ARQUIVO.csv]`: gera CSV so com itens sem ano (nome default se nao informar caminho).
+- `--limit N`: limita quantidade de arquivos por pasta (ordem alfabetica).
+- `--jobs N`: paralelismo da leitura local (PDF/EPUB).
+- `--only-missing-year`: processa so itens sem ano apos etapa local.
+- `--force-remote` / `--fetch-remote-always`: forca etapa remota mesmo quando local ja trouxe ano/estrutura suficiente.
+- `--quiet`: reduz logs de progresso no console.
+- `--omit-console`: silencia logs de console (exceto fatal); incompativel com `--review`.
+- `--generate-catalog`: gera catalogo de saida em `renamed/`.
+- `--catalog-format json|csv|both`: formato do catalogo quando `--generate-catalog` estiver ativo.
+- `--find-duplicates`: detecta duplicados por heuristica (ISBN, autor+titulo, fingerprint parcial).
+- `--duplicates-report [ARQUIVO.csv]`: define nome/caminho do relatorio de duplicados heuristico.
+- `--move-duplicates`: move duplicados heuristicos para pasta `duplicates/`; exige `--find-duplicates`.
+- `--prefer-format LISTA`: ordem de preferencia de formatos para escolher exemplar a manter em `--find-duplicates`.
+- `--prefer-larger`: em empate, prefere arquivo maior no modo de duplicados heuristico.
+- `--prefer-smaller`: em empate, prefere arquivo menor no modo de duplicados heuristico.
+- `--dedup`: detecta duplicados por hash completo (MD5/SHA1), separado de `--find-duplicates`.
+- `--dedup-algorithm md5|sha1`: algoritmo de hash para `--dedup`.
+- `--delete-dups`: move duplicados detectados por hash para `renamed/duplicates`; exige `--dedup`.
+
+Combinacoes invalidas importantes:
+- `--apply` com `--review`
+- `--fast` com `--thorough` ou `--search-speed`
+- `--find-duplicates` com `--dedup`
+- `--generate-catalog` com `--find-duplicates`/`--dedup`
+
 ## Dry-run, saidas e logs
 
 Para cada pasta raiz `PASTA`, o script grava em `PASTA/renamed/`:
