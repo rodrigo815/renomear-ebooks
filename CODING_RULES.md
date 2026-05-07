@@ -86,6 +86,7 @@ Regras:
 - Mensagens de erro devem indicar o arquivo, argumento ou operação que falhou.
 - Para erro esperado de uso, retornar código diferente de zero.
 - Para erro de programação, deixar a exceção aparecer durante desenvolvimento.
+- Para falhas de fonte externa, registrar causa estruturada (fonte + motivo) e seguir o lote quando possível.
 
 ## Logging and output
 
@@ -135,6 +136,13 @@ content = path.read_text(encoding="utf-8-sig")
 - Para bugfix, criar teste que falha antes da correção e passa depois.
 - Usar arquivos temporários para testar leitura e escrita.
 - Não depender de caminhos absolutos da máquina local.
+- Organizar regressões por famílias de erro quando fizer sentido:
+  - autor falso;
+  - ano falso;
+  - ruído editorial;
+  - multi-autor;
+  - volume/edição;
+  - transliteração/alias.
 
 ## Refactoring
 

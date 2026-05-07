@@ -27,8 +27,11 @@ Formato padrão de saída:
 - Score de confiança local vs final (`match_score`) e bandas de revisão.
 - Tolerância a falhas externas por fonte (timeout, conexão, HTTP, JSON inválido, campo ausente), com registro estruturado em `source_failures`.
 - Cache HTTP por pasta em `metadata_cache.json`.
+- Controle de previsibilidade operacional por limite de chamadas/custo/tempo por item.
 - Revisão interativa (`--review`) para itens não automáticos.
+- Modo de planejamento (`--planning-only`) com saída em Markdown + JSON sem renomear.
 - Overrides de autor via JSON (`author_overrides.json`).
+- Aliases canônicos opcionais de autor (`--author-aliases`).
 - Metadado suplementar via `.json`, `.csv` ou `.txt` (TSV).
 - Catálogo final opcional (`catalog.json`/`catalog.csv`).
 - Rotinas de duplicados:
@@ -115,14 +118,17 @@ python renomear_ebooks.py "E:\Livros" --exts "pdf,epub,.mobi"
 ## Flags principais
 
 - Escopo/execução:
+  - `--execution-profile safe|balanced|aggressive`: perfil pronto de execução.
   - `--recursive`: inclui subpastas na varredura.
   - `--limit N`: limita a quantidade de arquivos por pasta (ordem alfabética).
   - `--jobs N`: define paralelismo da leitura local (PDF/EPUB).
   - `--quiet`: reduz logs de progresso no console.
   - `--omit-console`: silencia logs de console (exceto fatal); incompatível com `--review`.
+  - `--planning-only`: só classifica risco e recomenda ação; não gera nome final.
 - Aplicação/revisão:
   - `--apply`: aplica renomeação/movimentação física (sem esta flag, permanece em simulação).
   - `--review`: revisão interativa para casos não automáticos; gera `review_needed.csv`; incompatível com `--apply`.
+  - `--quarantine`: ativa `originals/`, `failed/`, `converted/` no `renamed/`; backup pré-renomeio e quarentena de falhas.
 - Fontes remotas:
   - `--source offline|openlibrary|google|skoob|catalogs|wikipedia|web|all`: seleciona estratégia de consulta remota.
   - `--sources openlibrary,google,...`: restringe fontes quando `--source all`; tem precedência sobre velocidade.
@@ -133,6 +139,9 @@ python renomear_ebooks.py "E:\Livros" --exts "pdf,epub,.mobi"
   - `--search-speed 1..5`: ajusta intensidade de busca remota; incompatível com `--fast` e `--thorough`.
   - `--sleep SEG`: pausa entre requests HTTP.
   - `--max-pdf-pages N`: número máximo de páginas lidas no PDF para inferência local.
+  - `--max-remote-calls-per-file N`: limite de fontes remotas por item (0 = sem limite).
+  - `--max-estimated-cost VALOR`: teto de custo estimado por execução (0 = sem limite).
+  - `--item-timeout-s SEGUNDOS`: timeout total por item; excedido => decisão conservadora local.
 - Merge de metadados:
   - `--remote-metadata title,authors,year,isbn,publisher`: define quais campos podem ser atualizados pelo remoto.
   - `--keep-local-metadata ...`: define campos que devem manter valor local quando já preenchidos.
@@ -145,6 +154,7 @@ python renomear_ebooks.py "E:\Livros" --exts "pdf,epub,.mobi"
   - `--max-authors N`: limita autores no nome final; acima do limite vira `et al.`; `0` mostra todos.
 - Arquivos auxiliares:
   - `--overrides ARQUIVO.json`: caminho do JSON de sobrescrita de autores.
+  - `--author-aliases ARQUIVO.json`: aliases canônicos de autor (com proteção para não sobrescrever autor local forte).
   - `--supplementary-data ARQUIVO.(json|csv|txt)`: metadado adicional por arquivo.
   - `--supplementary-mode merge|override`: modo de aplicação do metadado suplementar.
 - Relatórios extras:
@@ -166,6 +176,9 @@ Para cada pasta raiz `PASTA`, o script grava em `PASTA/renamed/`:
 - `metadata_cache.json`
 - opcional: `missing_years.csv` (ou nome fornecido em `--missing-year-log`)
 - opcional: `review_needed.csv` (com `--review`)
+- `run_summary.md`
+- `phase_artifacts.json`
+- opcional: `planning_only.md` + `planning_only.json` (com `--planning-only`)
 - opcional: `catalog.json`/`catalog.csv` (com `--generate-catalog`)
 - opcional: `duplicates_report.csv` ou `duplicates.csv` (modos de deduplicação)
 
@@ -194,6 +207,8 @@ Colunas importantes no plano/log incluem:
 - Por padrão, roda em simulação.
 - Falhas de fonte externa não derrubam o lote inteiro.
 - Itens com falha externa + pontuação não automática podem ser marcados como `revisao_necessaria`.
+- Quando limites operacionais estouram (custo/chamadas/tempo), o item cai para decisão conservadora local.
+- Com `--quarantine`, arquivos originais e falhas ficam auditáveis por execução.
 
 ## Heurísticas bibliográficas (resumo)
 

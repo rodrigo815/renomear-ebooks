@@ -72,12 +72,13 @@ Tudo vive num único módulo; a separação é **lógica**, não por pacotes.
 2. **`build_local_metadata`** — Usa *thread pool* (`concurrent.futures`) para, por ficheiro, chamar `read_local_metadata` (EPUB/PDF ou stub) e combinar com **`parse_filename_fallback`**.
 3. **`prioritize_triplet_filename_over_local`** — Se o stem seguir padrão triplo (autor–ano–título ou ano–autor–título), o nome do ficheiro pode **sobrepor** metadado embutido.
 4. **Decisão offline vs remoto** — Com `--source offline`, ano já presente sem `--force-remote`, ou ficheiro em triplete “completo” no nome, evita-se `lookup_metadata`.
-5. **`lookup_metadata`** — Orquestra fontes remotas (subconjunto definido por `--sources` / perfis de velocidade), usa **`metadata_cache.json`**, faz **`merge_metadata`** com campos `--remote-metadata` / `--keep-local-metadata`. Pode sair cedo se Open Library devolver registo “confiável”; no fim pode **recuperar autores** só por título (Google Books).
+5. **`lookup_metadata`** — Orquestra fontes remotas (subconjunto definido por `--sources` / perfis de velocidade), usa **`metadata_cache.json`**, faz **`merge_metadata`** com campos `--remote-metadata` / `--keep-local-metadata`. Pode sair cedo se Open Library devolver registo “confiável”; no fim pode **recuperar autores** só por título (Google Books). O uso remoto é limitado por políticas de execução (`max_remote_calls_per_file`, `max_estimated_cost`, `item_timeout_s`).
 6. **`apply_supplementary_merged`** — Incorpora ficheiro suplementar (`--supplementary-data`), por caminho resolvido ou basename.
 7. **`patch_meta_from_filename_if_merged_suspect`** — “Failsafe” quando título HASH/t UNKNOWN ou autores absurdos.
 8. **`compute_match_evidence`** — Calcula score e dicionário de evidências (útil para `--review`).
 9. **`make_new_filename`** — Usa overrides (`author_overrides.json` + locks de revisão), padrão clássico ou `--filename-pattern`.
 10. **`unique_target`** — Evita colisões na pasta destino; renomeação real só com `--apply`.
+11. **`run_summary.md`** — Consolida estatísticas de execução e padrões de falha/ambiguidade.
 
 ## Subsistemas importantes
 
@@ -96,11 +97,13 @@ Ordem aproximada: saneamento de **ruído** (portais, referências tipo CIA), **n
 - **Sessão HTTP** reutilizável (pool, User-Agent).
 - **Cache em disco** por hash de URL+query; errors e HTML truncados entram na cache para não martelar o mesmo endpoint.
 - Delays configuráveis (`--sleep`, perfis `--fast` / `--thorough` / `--search-speed`).
+- Camada de previsibilidade por execução: limite de chamadas remotas por item, teto de custo estimado e timeout total por item.
 
 ### Saída
 
 - CSV de plano ou log com colunas normalizadas (incl. anti-formula em células).
 - Pastas de saída: por defeito `PASTA/renamed/` (ou a própria pasta se já for `renamed`).
+- Artefatos adicionais: `phase_artifacts.json`, `run_summary.md`, e no modo planejamento `planning_only.md`/`planning_only.json`.
 
 ## Pontos de extensão (sem alterar o núcleo)
 

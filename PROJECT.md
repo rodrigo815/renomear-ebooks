@@ -16,6 +16,7 @@ O README recomenda Python 3.10+ localmente; o pacote evita depender de APIs que 
 
 - **Monólito funcional**: a lógica principal concentra-se em `renomear_ebooks.py` (CLI, I/O, metadados locais/remotos, heurísticas de nome).
 - **Sem framework web**: script executável + módulo importável nos testes (`import renomear_ebooks`).
+- **Pipeline em 2 fases**: extração de sinais (`phase_artifacts.json`) e decisão final (nome/status/revisão).
 - **Dependências de runtime** (ver `requirements-dev.txt` para o conjunto usado em CI): `requests`, `rapidfuzz`, `pypdf` (PDF opcional mas recomendado).
 - **Opcional**: `defusedxml` para parsing de EPUB com endurecimento extra; sem ele usa-se `xml.etree` com limites de tamanho.
 
@@ -56,6 +57,7 @@ CI separa **lint** (uma corrida, Python 3.12) de **testes** (matriz 3.9–3.12).
 ## Dados auxiliares na raiz
 
 - `author_overrides.json`: overrides de autor (chave/valor conforme documentado no README).
+- `author_aliases.json` (opcional): mapa de alias canônico de autor.
 - Não commitar paths locais específicos de biblioteca; pastas de trabalho ficam fora do controle de versão.
 
 ---
