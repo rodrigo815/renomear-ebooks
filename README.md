@@ -118,7 +118,10 @@ python renomear_ebooks.py "E:\Livros" --exts "pdf,epub,.mobi"
 ## Flags principais
 
 - Escopo/execução:
-  - `--execution-profile safe|balanced|aggressive`: perfil pronto de execução.
+  - `--execution-profile safe|balanced|aggressive`: perfil pronto de execução (preset de comportamento):
+    - `safe`: sem rede, mais conservador e com foco em revisão.
+    - `balanced`: padrão recomendado para uso geral.
+    - `aggressive`: força busca remota ampla e maior tolerância a fallback.
   - `--recursive`: inclui subpastas na varredura.
   - `--limit N`: limita a quantidade de arquivos por pasta (ordem alfabética).
   - `--jobs N`: define paralelismo da leitura local (PDF/EPUB).
@@ -128,9 +131,9 @@ python renomear_ebooks.py "E:\Livros" --exts "pdf,epub,.mobi"
 - Aplicação/revisão:
   - `--apply`: aplica renomeação/movimentação física (sem esta flag, permanece em simulação).
   - `--review`: revisão interativa para casos não automáticos; gera `review_needed.csv`; incompatível com `--apply`.
-  - `--quarantine`: ativa `originals/`, `failed/`, `converted/` no `renamed/`; backup pré-renomeio e quarentena de falhas.
+  - `--quarantine` / `--no-quarantine`: quarentena operacional (padrão: ativa) com `originals/`, `failed/`, `converted/` no `renamed/`; backup pré-renomeio e quarentena de falhas.
 - Fontes remotas:
-  - `--source offline|openlibrary|google|skoob|catalogs|wikipedia|web|all`: seleciona estratégia de consulta remota.
+  - `--source offline|openlibrary|google|skoob|catalogs|wikipedia|web|all`: seleciona estratégia de consulta remota (padrão: `all`; com `--fast`, o subconjunto efetivo vira Open Library + Google Books).
   - `--sources openlibrary,google,...`: restringe fontes quando `--source all`; tem precedência sobre velocidade.
   - `--force-remote` (alias `--fetch-remote-always`): força etapa remota mesmo quando metadado local já parece suficiente.
 - Performance remota:
@@ -150,7 +153,7 @@ python renomear_ebooks.py "E:\Livros" --exts "pdf,epub,.mobi"
   - `--filename-pattern "%AUTHOR% - %DATE% - %TITLE%%FORMAT%"`: padrão customizado para saída.
   - `--unknown-year sd|omit`: com ano ausente, usa placeholder (`sd`) ou remove bloco de data (`omit`).
   - `--unknown-year-text TEXTO`: texto do placeholder de ano quando `sd` (padrão `s.d.`).
-  - `--omit-date-if-missing`: atalho para comportamento de `--unknown-year omit`.
+  - `--omit-date-if-missing` / `--no-omit-date-if-missing`: controle do bloco de data quando ano ausente (padrão: omitir data).
   - `--max-authors N`: limita autores no nome final; acima do limite vira `et al.`; `0` mostra todos.
 - Arquivos auxiliares:
   - `--overrides ARQUIVO.json`: caminho do JSON de sobrescrita de autores.
@@ -174,6 +177,7 @@ Para cada pasta raiz `PASTA`, o script grava em `PASTA/renamed/`:
 
 - `rename_plan.csv` (sem `--apply`) ou `rename_log.csv` (com `--apply`)
 - `metadata_cache.json`
+- `originals/`, `failed/`, `converted/` (quarentena operacional padrão; desative com `--no-quarantine`)
 - opcional: `missing_years.csv` (ou nome fornecido em `--missing-year-log`)
 - opcional: `review_needed.csv` (com `--review`)
 - `run_summary.md`
@@ -208,7 +212,7 @@ Colunas importantes no plano/log incluem:
 - Falhas de fonte externa não derrubam o lote inteiro.
 - Itens com falha externa + pontuação não automática podem ser marcados como `revisao_necessaria`.
 - Quando limites operacionais estouram (custo/chamadas/tempo), o item cai para decisão conservadora local.
-- Com `--quarantine`, arquivos originais e falhas ficam auditáveis por execução.
+- Por padrão, a quarentena operacional mantém arquivos originais e falhas auditáveis por execução.
 
 ## Heurísticas bibliográficas (resumo)
 

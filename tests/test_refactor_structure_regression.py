@@ -17,7 +17,7 @@ def _build_args(**overrides) -> argparse.Namespace:
         "keep_local_metadata": "",
         "unknown_year": "sd",
         "unknown_year_text": "s.d.",
-        "omit_date_if_missing": False,
+        "omit_date_if_missing": True,
         "fast": False,
         "thorough": False,
         "max_pdf_pages": 3,
@@ -30,7 +30,7 @@ def _build_args(**overrides) -> argparse.Namespace:
         "deep_analysis": False,
         "deep_analysis_review": False,
         "execution_profile": "balanced",
-        "quarantine": False,
+        "quarantine": True,
         "persist_intermediate": False,
         "max_remote_calls_per_file": 0,
         "max_estimated_cost": 0.0,
@@ -114,6 +114,7 @@ def test_structural_configure_runtime_args_defaults() -> None:
     assert args.effective_sleep == 0.25
     assert args.effective_max_pdf_pages == 3
     assert args.ext_filter is None
+    assert args.unknown_year == "omit"
 
 
 def test_structural_configure_runtime_args_fast_profile() -> None:

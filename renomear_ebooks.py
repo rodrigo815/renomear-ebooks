@@ -5118,11 +5118,6 @@ def _configure_runtime_args(args: argparse.Namespace) -> int | None:
         args.unknown_year_text = "s.d."
 
     if args.omit_date_if_missing:
-        if args.unknown_year == "sd":
-            log_warn(
-                "--omit-date-if-missing equivale a --unknown-year omit "
-                "(sem segmento de ano quando a data nao existir; com ano, o ano continua no nome)."
-            )
         args.unknown_year = "omit"
 
     if args.fast:
@@ -5400,16 +5395,18 @@ def main() -> int:
         choices=["safe", "balanced", "aggressive"],
         default="balanced",
         help=(
-            "Perfil pronto de execucao: safe (sem rede e revisao forte), "
-            "balanced (padrao atual), aggressive (mais remoto e mais tolerante a fallback)."
+            "Perfil pronto de execucao (preset de comportamento): "
+            "safe (sem rede e revisao forte), "
+            "balanced (equilibrado), aggressive (mais remoto e mais tolerante a fallback)."
         ),
     )
     ap.add_argument(
         "--quarantine",
-        action="store_true",
+        action=argparse.BooleanOptionalAction,
+        default=True,
         help=(
-            "Ativa quarentena operacional por execucao: cria originals/, failed/ e converted/ em renamed/; "
-            "faz backup pre-renomeio e move falhas para failed/."
+            "Quarentena operacional (padrao: ativa): cria originals/, failed/ e converted/ em renamed/; "
+            "faz backup pre-renomeio e move falhas para failed/. Use --no-quarantine para desativar."
         ),
     )
     ap.add_argument(
@@ -5486,6 +5483,7 @@ def main() -> int:
         default="all",
         help=(
             "Fonte(s) para completar metadado remoto (principalmente ano). "
+            "Padrao: all. "
             "'offline' nao acessa a rede. "
             "'all' tenta Open Library, Google Books, Skoob (DDG site:skoob.com.br), "
             "catalogos agregados (DDG site: worldcat, goodreads, storygraph, librarything, "
@@ -5554,11 +5552,12 @@ def main() -> int:
     )
     ap.add_argument(
         "--omit-date-if-missing",
-        action="store_true",
+        action=argparse.BooleanOptionalAction,
+        default=True,
         help=(
-            "Sem ano identificado, nao inclui a parte da data no nome (ex.: AUTOR - Titulo.ext). "
-            "Com ano, mantem AUTOR - ANO - TITULO. Equivale a --unknown-year omit; se usar junto "
-            "de sd, esta flag prevalece (mensagem no stderr)."
+            "Sem ano identificado, nao inclui a parte da data no nome (padrao: ativo; ex.: AUTOR - Titulo.ext). "
+            "Com ano, mantem AUTOR - ANO - TITULO. Equivale a --unknown-year omit. "
+            "Use --no-omit-date-if-missing para voltar ao placeholder de data desconhecida."
         ),
     )
     ap.add_argument(
