@@ -166,7 +166,7 @@ Checklist do comportamento atual:
 
 Pontos adicionais:
 
-- sanitização de caminho e caracteres invalidos;
+- sanitização de caminho e caracteres inválidos;
 - proteção anti formula injection em CSV;
 - escrita atômica de cache JSON.
 

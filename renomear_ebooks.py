@@ -1188,6 +1188,132 @@ def _bipartite_split_once(stem: str) -> tuple[str, str] | None:
     return None
 
 
+def _finish_filename_meta(meta: BookMeta, file_suffix: str) -> BookMeta:
+    if file_suffix:
+        meta.filename_extra_suffix = normalize_volume_edition_suffix(file_suffix)
+    return meta
+
+
+def _parse_filename_triplet_author_year_title(path: Path, stem: str) -> BookMeta | None:
+    m = re.match(
+        r"^(.+?)\s+-\s+((?:1[4-9]\d{2}|20\d{2}|s\.d\.))\s+-\s+(.+)$",
+        stem,
+        re.I,
+    )
+    if not m:
+        return None
+    authors = split_authors(m.group(1))
+    year = "" if m.group(2).lower() == "s.d." else m.group(2)
+    title = m.group(3)
+    return BookMeta(
+        str(path),
+        clean_title(title),
+        authors,
+        year,
+        source="filename",
+        confidence=0.35,
+        filename_paren_year=False,
+    )
+
+
+def _parse_filename_triplet_year_author_title(path: Path, stem: str) -> BookMeta | None:
+    m = re.match(r"^((?:1[4-9]\d{2}|20\d{2}))\s+-\s+(.+?)\s+-\s+(.+)$", stem)
+    if not m:
+        return None
+    year = m.group(1)
+    authors = split_authors(m.group(2))
+    title = m.group(3)
+    return BookMeta(
+        str(path),
+        clean_title(title),
+        authors,
+        year,
+        source="filename",
+        confidence=0.35,
+        filename_paren_year=False,
+    )
+
+
+def _parse_filename_nested_editor_parenthetical(
+    path: Path, stem: str, year: str, filename_paren_year: bool
+) -> BookMeta | None:
+    m = re.match(
+        r"^(.+?)\s*\(([^()]+)\s*\((?:eds?\.?|org\.?|trad\.?)\)\)\s*$",
+        stem,
+        re.I,
+    )
+    if not m:
+        return None
+    title = m.group(1)
+    authors = split_authors(m.group(2))
+    return BookMeta(
+        str(path),
+        clean_title(title),
+        authors,
+        year,
+        source="filename",
+        confidence=0.27,
+        filename_paren_year=filename_paren_year,
+    )
+
+
+def _parse_filename_simple_parenthetical(
+    path: Path, stem: str, year: str, filename_paren_year: bool
+) -> BookMeta | None:
+    m = re.match(r"^(.+?)\s*\(([^()]+)\)$", stem)
+    if not m:
+        return None
+    inner = compact_spaces(m.group(2))
+    if re.fullmatch(r"(?:1[4-9]\d{2}|20\d{2})", inner):
+        return BookMeta(
+            str(path),
+            clean_title(m.group(1)),
+            [],
+            inner,
+            source="filename",
+            confidence=0.28,
+            filename_paren_year=True,
+        )
+    if _parenthetical_is_editorial_note(inner):
+        title = stem
+        authors: list[str] = []
+    else:
+        title = m.group(1)
+        authors = split_authors(inner)
+    return BookMeta(
+        str(path),
+        clean_title(title),
+        authors,
+        year,
+        source="filename",
+        confidence=0.25,
+        filename_paren_year=filename_paren_year,
+    )
+
+
+def _parse_filename_bipartite_fallback(path: Path, stem: str, year: str, filename_paren_year: bool) -> BookMeta:
+    title = stem
+    authors: list[str] = []
+    conf_fb = 0.15
+    pair = _bipartite_split_once(stem)
+    if pair:
+        left, right = pair
+        if re.search(r"[A-Za-zÀ-ÿ]", left + right):
+            authors, title = _resolve_two_segments_to_authors_and_title(left, right)
+            if authors:
+                conf_fb = 0.2
+    title = re.sub(r"\b(1[4-9]\d{2}|20\d{2})\b", " ", title)
+    return BookMeta(
+        str(path),
+        clean_title(title),
+        authors,
+        year,
+        source="filename",
+        confidence=conf_fb,
+        filename_paren_year=filename_paren_year,
+    )
+
+
 def parse_filename_fallback(path: Path) -> BookMeta:
     stem_raw = compact_spaces(path.stem)
     stem_raw = _sanitize_filename_stem_noise(stem_raw)
@@ -1201,130 +1327,18 @@ def parse_filename_fallback(path: Path) -> BookMeta:
         or year_from_string(stem_hyp)
         or year_from_string(stem_raw)
     )
-    title = stem
-    authors: list[str] = []
+    for parser in (
+        lambda: _parse_filename_triplet_author_year_title(path, stem),
+        lambda: _parse_filename_triplet_year_author_title(path, stem),
+        lambda: _parse_filename_nested_editor_parenthetical(path, stem, year, filename_paren_year),
+        lambda: _parse_filename_simple_parenthetical(path, stem, year, filename_paren_year),
+    ):
+        parsed = parser()
+        if parsed is not None:
+            return _finish_filename_meta(parsed, file_suffix)
 
-    def _finish(meta: BookMeta) -> BookMeta:
-        if file_suffix:
-            meta.filename_extra_suffix = normalize_volume_edition_suffix(file_suffix)
-        return meta
-
-    m = re.match(
-        r"^(.+?)\s+-\s+((?:1[4-9]\d{2}|20\d{2}|s\.d\.))\s+-\s+(.+)$",
-        stem,
-        re.I,
-    )
-
-    if m:
-        authors = split_authors(m.group(1))
-        year = "" if m.group(2).lower() == "s.d." else m.group(2)
-        title = m.group(3)
-        return _finish(
-            BookMeta(
-                str(path),
-                clean_title(title),
-                authors,
-                year,
-                source="filename",
-                confidence=0.35,
-                filename_paren_year=False,
-            )
-        )
-
-    m = re.match(r"^((?:1[4-9]\d{2}|20\d{2}))\s+-\s+(.+?)\s+-\s+(.+)$", stem)
-
-    if m:
-        year = m.group(1)
-        authors = split_authors(m.group(2))
-        title = m.group(3)
-        return _finish(
-            BookMeta(
-                str(path),
-                clean_title(title),
-                authors,
-                year,
-                source="filename",
-                confidence=0.35,
-                filename_paren_year=False,
-            )
-        )
-
-    m = re.match(
-        r"^(.+?)\s*\(([^()]+)\s*\((?:eds?\.?|org\.?|trad\.?)\)\)\s*$",
-        stem,
-        re.I,
-    )
-    if m:
-        title = m.group(1)
-        authors = split_authors(m.group(2))
-        return _finish(
-            BookMeta(
-                str(path),
-                clean_title(title),
-                authors,
-                year,
-                source="filename",
-                confidence=0.27,
-                filename_paren_year=filename_paren_year,
-            )
-        )
-
-    m = re.match(r"^(.+?)\s*\(([^()]+)\)$", stem)
-
-    if m:
-        inner = compact_spaces(m.group(2))
-        if re.fullmatch(r"(?:1[4-9]\d{2}|20\d{2})", inner):
-            return _finish(
-                BookMeta(
-                    str(path),
-                    clean_title(m.group(1)),
-                    [],
-                    inner,
-                    source="filename",
-                    confidence=0.28,
-                    filename_paren_year=True,
-                )
-            )
-        if _parenthetical_is_editorial_note(inner):
-            title = stem
-            authors = []
-        else:
-            title = m.group(1)
-            authors = split_authors(inner)
-        return _finish(
-            BookMeta(
-                str(path),
-                clean_title(title),
-                authors,
-                year,
-                source="filename",
-                confidence=0.25,
-                filename_paren_year=filename_paren_year,
-            )
-        )
-
-    conf_fb = 0.15
-    pair = _bipartite_split_once(stem)
-    if pair:
-        left, right = pair
-        if re.search(r"[A-Za-zÀ-ÿ]", left + right):
-            authors, title = _resolve_two_segments_to_authors_and_title(left, right)
-            if authors:
-                conf_fb = 0.2
-
-    title = re.sub(r"\b(1[4-9]\d{2}|20\d{2})\b", " ", title)
-
-    return _finish(
-        BookMeta(
-            str(path),
-            clean_title(title),
-            authors,
-            year,
-            source="filename",
-            confidence=conf_fb,
-            filename_paren_year=filename_paren_year,
-        )
-    )
+    parsed = _parse_filename_bipartite_fallback(path, stem, year, filename_paren_year)
+    return _finish_filename_meta(parsed, file_suffix)
 
 
 def filename_triplet_structured_stem(path: Path) -> bool:
@@ -3633,25 +3647,20 @@ def interactive_review_item(
         log_warn("Opcao invalida (use A, E, P ou S).")
 
 
-def run_on_root(
-    folder: Path, args: argparse.Namespace
-) -> tuple[int, int, Path, Path, Path | None, Path | None]:
-    """Processa uma pasta-raiz; retorna (..., missing_path|None, review_needed_path|None)."""
+def _resolve_output_dir_for_root(folder: Path) -> Path:
     if folder.name.lower() == "renamed":
-        output_dir = folder
-    else:
-        output_dir = (folder / "renamed").resolve()
-    output_dir.mkdir(parents=True, exist_ok=True)
-    cache_path = output_dir / "metadata_cache.json"
-    plan_path = output_dir / ("rename_log.csv" if args.apply else "rename_plan.csv")
+        return folder
+    return (folder / "renamed").resolve()
 
+
+def _load_root_inputs(
+    folder: Path, args: argparse.Namespace, cache_path: Path
+) -> tuple[dict[str, Any], dict[str, Any], SupplementaryIndex | None]:
     overrides_path = Path(args.overrides)
     if not overrides_path.is_absolute():
         overrides_path = folder / overrides_path
-
     cache = load_json(cache_path)
     overrides = load_json(overrides_path)
-
     sup_index: SupplementaryIndex | None = None
     if compact_spaces(getattr(args, "supplementary_data", "")):
         sp = resolve_supplementary_path(Path(args.supplementary_data), folder)
@@ -3659,7 +3668,12 @@ def run_on_root(
             sup_index = load_supplementary_data(sp, folder)
         else:
             log_warn(f"Ficheiro --supplementary-data nao encontrado: {args.supplementary_data}")
+    return cache, overrides, sup_index
 
+
+def _collect_local_pairs_for_root(
+    folder: Path, output_dir: Path, args: argparse.Namespace
+) -> list[tuple[Path, BookMeta]]:
     exclude_dir = output_dir if output_dir != folder else None
     files = iter_files(
         folder,
@@ -3669,7 +3683,6 @@ def run_on_root(
     )
     if args.limit and args.limit > 0:
         files = files[: args.limit]
-
     local_pairs = build_local_metadata(
         files,
         max_pdf_pages=args.effective_max_pdf_pages,
@@ -3678,6 +3691,104 @@ def run_on_root(
     )
     if args.only_missing_year:
         local_pairs = [(p, m) for (p, m) in local_pairs if not m.year]
+    return local_pairs
+
+
+def _should_use_offline_lookup(local: BookMeta, path: Path, args: argparse.Namespace) -> bool:
+    skip_remote_triplet = filename_triplet_structured_stem(path) and not args.effective_force_remote
+    return args.source == "offline" or (local.year and not args.effective_force_remote) or skip_remote_triplet
+
+
+def _write_plan_csv(plan_path: Path, rows: list[dict[str, str]]) -> None:
+    with plan_path.open("w", encoding="utf-8-sig", newline="") as f:
+        writer = csv.DictWriter(
+            f,
+            fieldnames=[
+                "original",
+                "novo",
+                "status",
+                "titulo",
+                "autores",
+                "ano",
+                "isbn",
+                "fonte",
+                "confianca",
+                "pontuacao",
+                "evidencias",
+                "source_failures",
+                "notas",
+            ],
+        )
+        writer.writeheader()
+        for row in rows:
+            writer.writerow(_csv_safe_row(row))
+
+
+def _write_review_needed_csv(
+    output_dir: Path, args: argparse.Namespace, review_needed_rows: list[dict[str, str]]
+) -> Path | None:
+    if not getattr(args, "review", False):
+        return None
+    review_path_out = output_dir / "review_needed.csv"
+    with review_path_out.open("w", encoding="utf-8-sig", newline="") as rf:
+        rw = csv.DictWriter(
+            rf,
+            fieldnames=[
+                "original",
+                "novo_sugerido",
+                "pontuacao",
+                "faixa",
+                "escolha_revisao",
+                "titulo",
+                "autores",
+                "evidencias",
+                "source_failures",
+            ],
+        )
+        rw.writeheader()
+        for row in review_needed_rows:
+            rw.writerow(_csv_safe_row(row))
+    return review_path_out
+
+
+def _write_missing_year_csv(
+    output_dir: Path, args: argparse.Namespace, missing_year_rows: list[dict[str, str]]
+) -> Path | None:
+    if not args.missing_year_log:
+        return None
+    missing_path = Path(args.missing_year_log)
+    if not missing_path.is_absolute():
+        missing_path = output_dir / missing_path
+    with missing_path.open("w", encoding="utf-8-sig", newline="") as f:
+        writer = csv.DictWriter(
+            f,
+            fieldnames=[
+                "original",
+                "novo_com_sd",
+                "status_atual",
+                "titulo",
+                "autores",
+                "fonte",
+                "source_failures",
+                "notas",
+            ],
+        )
+        writer.writeheader()
+        for row in missing_year_rows:
+            writer.writerow(_csv_safe_row(row))
+    return missing_path
+
+
+def run_on_root(
+    folder: Path, args: argparse.Namespace
+) -> tuple[int, int, Path, Path, Path | None, Path | None]:
+    """Processa uma pasta-raiz; retorna (..., missing_path|None, review_needed_path|None)."""
+    output_dir = _resolve_output_dir_for_root(folder)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    cache_path = output_dir / "metadata_cache.json"
+    plan_path = output_dir / ("rename_log.csv" if args.apply else "rename_plan.csv")
+    cache, overrides, sup_index = _load_root_inputs(folder, args, cache_path)
+    local_pairs = _collect_local_pairs_for_root(folder, output_dir, args)
 
     reserved: set[Path] = set()
     rows: list[dict[str, str]] = []
@@ -3688,14 +3799,7 @@ def run_on_root(
 
     for path, local in local_pairs:
         local = prioritize_triplet_filename_over_local(local, path)
-        skip_remote_triplet = (
-            filename_triplet_structured_stem(path) and not args.effective_force_remote
-        )
-        should_use_offline = (
-            args.source == "offline"
-            or (local.year and not args.effective_force_remote)
-            or skip_remote_triplet
-        )
+        should_use_offline = _should_use_offline_lookup(local, path, args)
         if should_use_offline:
             meta = local
         else:
@@ -3854,75 +3958,9 @@ def run_on_root(
             )
 
     save_json(cache_path, cache)
-
-    with plan_path.open("w", encoding="utf-8-sig", newline="") as f:
-        writer = csv.DictWriter(
-            f,
-            fieldnames=[
-                "original",
-                "novo",
-                "status",
-                "titulo",
-                "autores",
-                "ano",
-                "isbn",
-                "fonte",
-                "confianca",
-                "pontuacao",
-                "evidencias",
-                "source_failures",
-                "notas",
-            ],
-        )
-
-        writer.writeheader()
-        for row in rows:
-            writer.writerow(_csv_safe_row(row))
-
-    review_path_out: Path | None = None
-    if getattr(args, "review", False):
-        review_path_out = output_dir / "review_needed.csv"
-        with review_path_out.open("w", encoding="utf-8-sig", newline="") as rf:
-            rw = csv.DictWriter(
-                rf,
-                fieldnames=[
-                    "original",
-                    "novo_sugerido",
-                    "pontuacao",
-                    "faixa",
-                    "escolha_revisao",
-                    "titulo",
-                    "autores",
-                    "evidencias",
-                    "source_failures",
-                ],
-            )
-            rw.writeheader()
-            for row in review_needed_rows:
-                rw.writerow(_csv_safe_row(row))
-
-    missing_path: Path | None = None
-    if args.missing_year_log:
-        missing_path = Path(args.missing_year_log)
-        if not missing_path.is_absolute():
-            missing_path = output_dir / missing_path
-        with missing_path.open("w", encoding="utf-8-sig", newline="") as f:
-            writer = csv.DictWriter(
-                f,
-                fieldnames=[
-                    "original",
-                    "novo_com_sd",
-                    "status_atual",
-                    "titulo",
-                    "autores",
-                    "fonte",
-                    "source_failures",
-                    "notas",
-                ],
-            )
-            writer.writeheader()
-            for row in missing_year_rows:
-                writer.writerow(_csv_safe_row(row))
+    _write_plan_csv(plan_path, rows)
+    review_path_out = _write_review_needed_csv(output_dir, args, review_needed_rows)
+    missing_path = _write_missing_year_csv(output_dir, args, missing_year_rows)
 
     if getattr(args, "generate_catalog", False):
         for wp in write_catalog_entries(
@@ -4161,6 +4199,225 @@ def run_find_duplicates(folder: Path, args: argparse.Namespace) -> Path | None:
     if args.move_duplicates:
         log_info(f"Arquivos movidos para: {_resolved_path(dup_dir)}")
     return report_path
+
+
+def _configure_runtime_args(args: argparse.Namespace) -> int | None:
+    if args.omit_console and args.review:
+        log_error("--omit-console nao combina com --review (e preciso ver mensagens no terminal).")
+        return 2
+
+    log_set_omit_console(bool(args.omit_console))
+
+    if not _HAS_DEFUSED_XML:
+        log_warn(
+            "defusedxml nao instalado; XML de EPUB e lido com xml.etree (limite de "
+            "tamanho aplicado). Instale 'defusedxml' para defesa adicional contra XML-bomb."
+        )
+
+    try:
+        sources_parsed = (
+            parse_remote_sources_csv(args.sources)
+            if compact_spaces(args.sources)
+            else None
+        )
+    except ValueError as e:
+        log_error(f"Erro em --sources: {e}")
+        return 2
+
+    if args.source == "offline" and sources_parsed is not None:
+        log_error("--sources nao combina com --source offline.")
+        return 2
+
+    if args.source not in ("offline", "all") and (
+        sources_parsed is not None or args.search_speed is not None
+    ):
+        log_error(
+            "--sources e --search-speed exigem --source all (fonte unica legacy e incompativel)."
+        )
+        return 2
+
+    try:
+        args.remote_merge_fields = (
+            parse_merge_metadata_csv(args.remote_metadata)
+            if compact_spaces(args.remote_metadata)
+            else MERGE_METADATA_FIELDS
+        )
+    except ValueError as e:
+        log_error(f"Erro em --remote-metadata: {e}")
+        return 2
+
+    try:
+        args.keep_local_metadata_fields = (
+            parse_merge_metadata_csv(args.keep_local_metadata)
+            if compact_spaces(args.keep_local_metadata)
+            else frozenset()
+        )
+    except ValueError as e:
+        log_error(f"Erro em --keep-local-metadata: {e}")
+        return 2
+
+    args.unknown_year_text = compact_spaces(args.unknown_year_text or "")
+    if args.unknown_year == "sd" and not args.unknown_year_text:
+        args.unknown_year_text = "s.d."
+
+    if args.omit_date_if_missing:
+        if args.unknown_year == "sd":
+            log_warn(
+                "--omit-date-if-missing equivale a --unknown-year omit "
+                "(sem segmento de ano quando a data nao existir; com ano, o ano continua no nome)."
+            )
+        args.unknown_year = "omit"
+
+    if args.fast:
+        args.effective_sleep = 0.0
+        args.effective_max_pdf_pages = max(0, min(args.max_pdf_pages, 1))
+        args.effective_force_remote = args.force_remote
+        args.skip_author_enrich = True
+    elif args.thorough:
+        args.effective_sleep = max(args.sleep, 0.35)
+        args.effective_max_pdf_pages = min(max(args.max_pdf_pages, 5), 15)
+        args.effective_force_remote = args.force_remote
+        args.skip_author_enrich = False
+    elif args.search_speed is not None:
+        spd = args.search_speed
+        if spd == 5:
+            args.effective_sleep = 0.0
+            args.effective_max_pdf_pages = max(0, min(args.max_pdf_pages, 1))
+            args.effective_force_remote = args.force_remote
+            args.skip_author_enrich = True
+        elif spd == 4:
+            args.effective_sleep = max(args.sleep, 0.08)
+            args.effective_max_pdf_pages = max(0, min(args.max_pdf_pages, 2))
+            args.effective_force_remote = args.force_remote
+            args.skip_author_enrich = True
+        elif spd == 3:
+            args.effective_sleep = max(args.sleep, 0.15)
+            args.effective_max_pdf_pages = max(0, min(args.max_pdf_pages, 3))
+            args.effective_force_remote = args.force_remote
+            args.skip_author_enrich = True
+        elif spd == 2:
+            args.effective_sleep = max(args.sleep, 0.22)
+            args.effective_max_pdf_pages = args.max_pdf_pages
+            args.effective_force_remote = args.force_remote
+            args.skip_author_enrich = False
+        else:
+            args.effective_sleep = max(args.sleep, 0.35)
+            args.effective_max_pdf_pages = min(max(args.max_pdf_pages, 5), 15)
+            args.effective_force_remote = args.force_remote
+            args.skip_author_enrich = False
+    else:
+        args.effective_sleep = args.sleep
+        args.effective_max_pdf_pages = args.max_pdf_pages
+        args.effective_force_remote = args.force_remote
+        args.skip_author_enrich = False
+
+    if args.source == "offline":
+        args.enabled_remote_sources = frozenset()
+    elif sources_parsed is not None:
+        args.enabled_remote_sources = sources_parsed
+    elif args.fast:
+        args.enabled_remote_sources = SEARCH_SPEED_TO_SOURCES[5]
+    elif args.thorough:
+        args.enabled_remote_sources = ALL_REMOTE_SOURCES
+    elif args.search_speed is not None:
+        args.enabled_remote_sources = SEARCH_SPEED_TO_SOURCES[args.search_speed]
+    elif args.source == "all":
+        args.enabled_remote_sources = ALL_REMOTE_SOURCES
+    else:
+        leg = args.source.lower()
+        if leg in ("googlebooks", "google"):
+            leg = "google"
+        args.enabled_remote_sources = frozenset({leg})
+
+    if compact_spaces(args.exts):
+        try:
+            args.ext_filter = parse_exts_csv(args.exts)
+        except ValueError as e:
+            log_error(f"Erro em --exts: {e}")
+            return 2
+    else:
+        args.ext_filter = None
+    return None
+
+
+def _validate_main_modes(args: argparse.Namespace, roots: list[Path]) -> int | None:
+    for folder in roots:
+        if not folder.exists() or not folder.is_dir():
+            log_error(f"Pasta invalida: {folder}")
+            return 2
+
+    if args.apply and args.review:
+        log_error("--apply e --review nao podem ser usados juntos.")
+        return 2
+    if args.move_duplicates and not args.find_duplicates:
+        log_error("--move-duplicates exige --find-duplicates.")
+        return 2
+    if args.prefer_larger and args.prefer_smaller:
+        log_error("Use apenas uma de --prefer-larger ou --prefer-smaller.")
+        return 2
+    if args.delete_dups and not args.dedup:
+        log_error("--delete-dups exige --dedup.")
+        return 2
+    if args.dedup and args.find_duplicates:
+        log_error("--dedup e --find-duplicates sao mutuamente exclusivos.")
+        return 2
+    if args.generate_catalog and (args.find_duplicates or args.dedup):
+        log_error("--generate-catalog nao pode ser usado com --find-duplicates ou --dedup.")
+        return 2
+    return None
+
+
+def _execute_main_flow(args: argparse.Namespace, roots: list[Path]) -> int:
+    if args.find_duplicates:
+        if args.apply or args.review:
+            log_error("--find-duplicates nao combina com --apply nem com --review.")
+            return 2
+        n_roots_dup = len(roots)
+        for folder in roots:
+            if n_roots_dup > 1 and not args.quiet:
+                log_info(f"\n--- duplicados: {folder} ---")
+            run_find_duplicates(folder, args)
+        return 0
+
+    if args.dedup:
+        if args.apply or args.review:
+            log_error("--dedup nao combina com --apply nem com --review.")
+            return 2
+        n_roots_ded = len(roots)
+        for folder in roots:
+            if n_roots_ded > 1 and not args.quiet:
+                log_info(f"\n--- dedup (hash): {folder} ---")
+            run_dedup_hashes(folder, args)
+        return 0
+
+    total_analysed = 0
+    total_missing = 0
+    n_roots = len(roots)
+    for folder in roots:
+        if n_roots > 1 and not args.quiet:
+            log_info(f"\n--- {folder} ---")
+        n_rows, miss, plan_path, cache_path, missing_path, review_path = run_on_root(folder, args)
+        total_analysed += n_rows
+        total_missing += miss
+        log_info(f"\nArquivos analisados (esta pasta): {n_rows}")
+        log_info(f"Sem ano identificado (esta pasta): {miss}")
+        log_info(f"Plano/log salvo em: {plan_path}")
+        log_info(f"Cache salvo em: {cache_path}")
+        if missing_path is not None:
+            log_info(f"Log de sem-data salvo em: {missing_path}")
+        if review_path is not None:
+            log_info(f"Revisao sugerida (CSV): {review_path}")
+
+    if n_roots > 1:
+        log_info(f"\nTotal em {n_roots} pastas: {total_analysed} arquivos, {total_missing} sem ano.")
+    if not args.apply:
+        log_info("Simulacao apenas. Para renomear de verdade, rode novamente com --apply.")
+        if args.source == "offline" and total_missing > 0:
+            log_info(
+                "Dica: use --source all para tentar completar anos (Open Library, Google Books, "
+                "Skoob, catalogs agregados, Wikipedia e fallback web)."
+            )
+    return 0
 
 
 def main() -> int:
@@ -4595,226 +4852,14 @@ def main() -> int:
 
     args = ap.parse_args()
     args.review_author_lock = {}
-
-    if args.omit_console and args.review:
-        log_error("--omit-console nao combina com --review (e preciso ver mensagens no terminal).")
-        return 2
-
-    log_set_omit_console(bool(args.omit_console))
-
-    if not _HAS_DEFUSED_XML:
-        log_warn(
-            "defusedxml nao instalado; XML de EPUB e lido com xml.etree (limite de "
-            "tamanho aplicado). Instale 'defusedxml' para defesa adicional contra XML-bomb."
-        )
-
-    try:
-        sources_parsed = (
-            parse_remote_sources_csv(args.sources)
-            if compact_spaces(args.sources)
-            else None
-        )
-    except ValueError as e:
-        log_error(f"Erro em --sources: {e}")
-        return 2
-
-    if args.source == "offline" and sources_parsed is not None:
-        log_error("--sources nao combina com --source offline.")
-        return 2
-
-    if args.source not in ("offline", "all") and (
-        sources_parsed is not None or args.search_speed is not None
-    ):
-        log_error(
-            "--sources e --search-speed exigem --source all (fonte unica legacy e incompativel)."
-        )
-        return 2
-
-    try:
-        args.remote_merge_fields = (
-            parse_merge_metadata_csv(args.remote_metadata)
-            if compact_spaces(args.remote_metadata)
-            else MERGE_METADATA_FIELDS
-        )
-    except ValueError as e:
-        log_error(f"Erro em --remote-metadata: {e}")
-        return 2
-
-    try:
-        args.keep_local_metadata_fields = (
-            parse_merge_metadata_csv(args.keep_local_metadata)
-            if compact_spaces(args.keep_local_metadata)
-            else frozenset()
-        )
-    except ValueError as e:
-        log_error(f"Erro em --keep-local-metadata: {e}")
-        return 2
-
-    args.unknown_year_text = compact_spaces(args.unknown_year_text or "")
-    if args.unknown_year == "sd" and not args.unknown_year_text:
-        args.unknown_year_text = "s.d."
-
-    if args.omit_date_if_missing:
-        if args.unknown_year == "sd":
-            log_warn(
-                "--omit-date-if-missing equivale a --unknown-year omit "
-                "(sem segmento de ano quando a data nao existir; com ano, o ano continua no nome)."
-            )
-        args.unknown_year = "omit"
-
-    if args.fast:
-        args.effective_sleep = 0.0
-        args.effective_max_pdf_pages = max(0, min(args.max_pdf_pages, 1))
-        args.effective_force_remote = args.force_remote
-        args.skip_author_enrich = True
-    elif args.thorough:
-        args.effective_sleep = max(args.sleep, 0.35)
-        args.effective_max_pdf_pages = min(max(args.max_pdf_pages, 5), 15)
-        args.effective_force_remote = args.force_remote
-        args.skip_author_enrich = False
-    elif args.search_speed is not None:
-        spd = args.search_speed
-        if spd == 5:
-            args.effective_sleep = 0.0
-            args.effective_max_pdf_pages = max(0, min(args.max_pdf_pages, 1))
-            args.effective_force_remote = args.force_remote
-            args.skip_author_enrich = True
-        elif spd == 4:
-            args.effective_sleep = max(args.sleep, 0.08)
-            args.effective_max_pdf_pages = max(0, min(args.max_pdf_pages, 2))
-            args.effective_force_remote = args.force_remote
-            args.skip_author_enrich = True
-        elif spd == 3:
-            args.effective_sleep = max(args.sleep, 0.15)
-            args.effective_max_pdf_pages = max(0, min(args.max_pdf_pages, 3))
-            args.effective_force_remote = args.force_remote
-            args.skip_author_enrich = True
-        elif spd == 2:
-            args.effective_sleep = max(args.sleep, 0.22)
-            args.effective_max_pdf_pages = args.max_pdf_pages
-            args.effective_force_remote = args.force_remote
-            args.skip_author_enrich = False
-        else:
-            args.effective_sleep = max(args.sleep, 0.35)
-            args.effective_max_pdf_pages = min(max(args.max_pdf_pages, 5), 15)
-            args.effective_force_remote = args.force_remote
-            args.skip_author_enrich = False
-    else:
-        args.effective_sleep = args.sleep
-        args.effective_max_pdf_pages = args.max_pdf_pages
-        args.effective_force_remote = args.force_remote
-        args.skip_author_enrich = False
-
-    if args.source == "offline":
-        args.enabled_remote_sources = frozenset()
-    elif sources_parsed is not None:
-        args.enabled_remote_sources = sources_parsed
-    elif args.fast:
-        args.enabled_remote_sources = SEARCH_SPEED_TO_SOURCES[5]
-    elif args.thorough:
-        args.enabled_remote_sources = ALL_REMOTE_SOURCES
-    elif args.search_speed is not None:
-        args.enabled_remote_sources = SEARCH_SPEED_TO_SOURCES[args.search_speed]
-    elif args.source == "all":
-        args.enabled_remote_sources = ALL_REMOTE_SOURCES
-    else:
-        leg = args.source.lower()
-        if leg in ("googlebooks", "google"):
-            leg = "google"
-        args.enabled_remote_sources = frozenset({leg})
-
-    if compact_spaces(args.exts):
-        try:
-            args.ext_filter = parse_exts_csv(args.exts)
-        except ValueError as e:
-            log_error(f"Erro em --exts: {e}")
-            return 2
-    else:
-        args.ext_filter = None
-
+    rc = _configure_runtime_args(args)
+    if rc is not None:
+        return rc
     roots = [Path(f).expanduser().resolve() for f in args.folders]
-    for folder in roots:
-        if not folder.exists() or not folder.is_dir():
-            log_error(f"Pasta invalida: {folder}")
-            return 2
-
-    if args.apply and args.review:
-        log_error("--apply e --review nao podem ser usados juntos.")
-        return 2
-
-    if args.move_duplicates and not args.find_duplicates:
-        log_error("--move-duplicates exige --find-duplicates.")
-        return 2
-
-    if args.prefer_larger and args.prefer_smaller:
-        log_error("Use apenas uma de --prefer-larger ou --prefer-smaller.")
-        return 2
-
-    if args.delete_dups and not args.dedup:
-        log_error("--delete-dups exige --dedup.")
-        return 2
-
-    if args.dedup and args.find_duplicates:
-        log_error("--dedup e --find-duplicates sao mutuamente exclusivos.")
-        return 2
-
-    if args.generate_catalog and (args.find_duplicates or args.dedup):
-        log_error("--generate-catalog nao pode ser usado com --find-duplicates ou --dedup.")
-        return 2
-
-    if args.find_duplicates:
-        if args.apply or args.review:
-            log_error("--find-duplicates nao combina com --apply nem com --review.")
-            return 2
-        n_roots_dup = len(roots)
-        for folder in roots:
-            if n_roots_dup > 1 and not args.quiet:
-                log_info(f"\n--- duplicados: {folder} ---")
-            run_find_duplicates(folder, args)
-        return 0
-
-    if args.dedup:
-        if args.apply or args.review:
-            log_error("--dedup nao combina com --apply nem com --review.")
-            return 2
-        n_roots_ded = len(roots)
-        for folder in roots:
-            if n_roots_ded > 1 and not args.quiet:
-                log_info(f"\n--- dedup (hash): {folder} ---")
-            run_dedup_hashes(folder, args)
-        return 0
-
-    total_analysed = 0
-    total_missing = 0
-    n_roots = len(roots)
-
-    for folder in roots:
-        if n_roots > 1 and not args.quiet:
-            log_info(f"\n--- {folder} ---")
-        n_rows, miss, plan_path, cache_path, missing_path, review_path = run_on_root(folder, args)
-        total_analysed += n_rows
-        total_missing += miss
-        log_info(f"\nArquivos analisados (esta pasta): {n_rows}")
-        log_info(f"Sem ano identificado (esta pasta): {miss}")
-        log_info(f"Plano/log salvo em: {plan_path}")
-        log_info(f"Cache salvo em: {cache_path}")
-        if missing_path is not None:
-            log_info(f"Log de sem-data salvo em: {missing_path}")
-        if review_path is not None:
-            log_info(f"Revisao sugerida (CSV): {review_path}")
-
-    if n_roots > 1:
-        log_info(f"\nTotal em {n_roots} pastas: {total_analysed} arquivos, {total_missing} sem ano.")
-
-    if not args.apply:
-        log_info("Simulacao apenas. Para renomear de verdade, rode novamente com --apply.")
-        if args.source == "offline" and total_missing > 0:
-            log_info(
-                "Dica: use --source all para tentar completar anos (Open Library, Google Books, "
-                "Skoob, catalogs agregados, Wikipedia e fallback web)."
-            )
-
-    return 0
+    rc = _validate_main_modes(args, roots)
+    if rc is not None:
+        return rc
+    return _execute_main_flow(args, roots)
 
 
 if __name__ == "__main__":
