@@ -206,8 +206,7 @@ BAD_AUTHOR_WORDS = {
     "scanner", "scan", "converter", "convertido", "icecream", "pdf", "acrobat",
     "adobe", "microsoft", "word", "utilizador", "usuario",
     "traduzido", "traduzida", "translator", "translation",
-    "etc", "etc.", "espanhol", "spanish", "português", "portugues", "english", "ingles",
-    "nazbol", "nazbols", "afins", "ppsh",
+    "etc", "etc.",
 }
 
 BAD_TITLE_WORDS = {

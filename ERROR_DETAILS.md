@@ -24,7 +24,7 @@ Os erros reportados se concentram em **7 grupos de causa**:
   - ano remoto aceito por match textual, mas sem restrição suficiente por plausibilidade histórica da obra/autor;
   - preferência por edições recentes em certos snippets de busca.
 - **Pontos de código**:
-  - `best_*` (fontes remotas), `merge_metadata()`, `compute_match_evidence()`.
+  - `best_`* (fontes remotas), `merge_metadata()`, `compute_match_evidence()`.
 
 ### C2) Conteúdo entre parênteses promovido a autor
 
@@ -102,3 +102,4 @@ Arquivo: `tests/test_error_causes_diagnostics.py`
 - Contém casos por causa (C1..C7).
 - Casos corrigidos estão como testes normais.
 - Não há pendências `xfail` nesta suíte diagnóstica após os patches finais de C4/C5.
+
