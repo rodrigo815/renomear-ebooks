@@ -205,6 +205,8 @@ BAD_AUTHOR_WORDS = {
     "scanner", "scan", "converter", "convertido", "icecream", "pdf", "acrobat",
     "adobe", "microsoft", "word", "utilizador", "usuario",
     "traduzido", "traduzida", "translator", "translation",
+    "etc", "etc.", "espanhol", "spanish", "português", "portugues", "english", "ingles",
+    "nazbol", "nazbols", "afins", "ppsh",
 }
 
 BAD_TITLE_WORDS = {
@@ -264,7 +266,9 @@ def strip_accents(s: str) -> str:
 
 def clean_title(s: str) -> str:
     s = compact_spaces(s)
-    return s.strip(" .-_")
+    s = s.strip(" .-_")
+    s = re.sub(r"(?i)\bcadernos do cárcere\b", "Cadernos do Cárcere", s)
+    return s
 
 
 def append_note(meta: BookMeta, note: str) -> None:
@@ -400,9 +404,15 @@ def _parenthetical_is_editorial_note(inner: str) -> bool:
         return True
     if _EDITORIAL_PAREN_RE.match(t):
         return True
+    if re.fullmatch(r"[A-ZÀ-Ý]{2,8}", t):
+        return True
     if author_looks_bad(t):
         return True
     tl = t.lower()
+    if tl in {"espanhol", "spanish", "português", "portugues", "english", "ingles"}:
+        return True
+    if re.fullmatch(r"[a-zà-ÿ0-9 .,'’-]+", tl) and " e " in f" {tl} ":
+        return True
     if "traduz" in tl or "translat" in tl:
         return True
     if re.search(
@@ -1002,6 +1012,7 @@ def normalize_volume_edition_suffix(s: str) -> str:
         t,
         flags=re.I,
     )
+    t = re.sub(r"\b(?:vol(?:ume)?\.?)\s*([0-9IVXLC]+)\b", r"Vol. \1", t, flags=re.I)
     return compact_spaces(t)
 
 
@@ -1085,6 +1096,28 @@ def _resolve_two_segments_to_authors_and_title(left: str, right: str) -> tuple[l
     lt, rt = _segment_title_likelihood(left), _segment_title_likelihood(right)
     strong_mononyms = {"marx", "engels", "lenin", "darwin", "nietzsche"}
     nl, nr = normalize_for_match(left), normalize_for_match(right)
+
+    def _looks_like_person_name_segment(seg: str) -> bool:
+        s = compact_spaces(seg)
+        if author_looks_bad(s):
+            return False
+        toks = s.split()
+        if toks and toks[0].lower().strip(".'’") in {"o", "a", "os", "as", "the", "el", "la", "los", "las"}:
+            return False
+        if re.search(r"\b(?:review|journal|magazine|bulletin|volume|vol\.?)\b", s, re.I):
+            return False
+        if re.search(r"\b(?:and|e|of|do|da|de|dos|das)\b", s, re.I) and len(s.split()) >= 3:
+            return False
+        if not (1 <= len(toks) <= 4):
+            return False
+        return bool(re.search(r"[A-Za-zÀ-ÿ]", s))
+
+    left_personish = _looks_like_person_name_segment(left)
+    right_personish = _looks_like_person_name_segment(right)
+    if left_personish and not right_personish:
+        return split_authors(left), right
+    if right_personish and not left_personish:
+        return split_authors(right), left
     if (
         len(left.split()) == 1
         and nl in strong_mononyms
@@ -1275,8 +1308,15 @@ def _parse_filename_simple_parenthetical(
             filename_paren_year=True,
         )
     if _parenthetical_is_editorial_note(inner):
-        title = stem
-        authors: list[str] = []
+        base = m.group(1)
+        pair = _bipartite_split_once(base)
+        if pair:
+            left, right = pair
+            authors, title_base = _resolve_two_segments_to_authors_and_title(left, right)
+            title = f"{title_base} ({inner})" if title_base else f"{base} ({inner})"
+        else:
+            title = stem
+            authors = []
     else:
         title = m.group(1)
         authors = split_authors(inner)
@@ -1298,6 +1338,20 @@ def _parse_filename_bipartite_fallback(path: Path, stem: str, year: str, filenam
     pair = _bipartite_split_once(stem)
     if pair:
         left, right = pair
+        if re.search(r"\b(?:review|journal|magazine|bulletin)\b", left, re.I) and re.search(
+            r"\b(?:vol\.?|volume|no\.?|nº)\b",
+            right,
+            re.I,
+        ):
+            return BookMeta(
+                str(path),
+                clean_title(compact_spaces(f"{left} - {right}")),
+                [],
+                year,
+                source="filename",
+                confidence=0.18,
+                filename_paren_year=filename_paren_year,
+            )
         if re.search(r"[A-Za-zÀ-ÿ]", left + right):
             authors, title = _resolve_two_segments_to_authors_and_title(left, right)
             if authors:
@@ -2352,7 +2406,11 @@ def merge_metadata(
                 else:
                     out.year = ry
             else:
-                out.year = ry or ly or ""
+                if ry and is_year_token(ry) and int(ry) < 1700:
+                    out.year = ly or ""
+                    append_note(out, f"guardrail: ano remoto muito antigo ({ry}) ignorado")
+                else:
+                    out.year = ry or ly or ""
 
     # --- isbn ---
     if "isbn" in klf:
