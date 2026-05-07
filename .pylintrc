@@ -1,0 +1,23 @@
+[MAIN]
+# Projeto de script único + suíte de testes com mocks.
+# Mantemos Pylint focado em erros reais (E/F) e ignoramos ruído estrutural.
+disable =
+    C,
+    R,
+    W,
+    import-error,
+    no-member,
+    unsubscriptable-object
+
+[MESSAGES CONTROL]
+# Redundante por compatibilidade entre versões do pylint.
+disable =
+    C,
+    R,
+    W,
+    import-error,
+    no-member,
+    unsubscriptable-object
+
+[FORMAT]
+max-line-length = 120
