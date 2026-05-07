@@ -37,6 +37,7 @@ except Exception:
 
 
 _HTTP_SESSION: requests.Session | None = None
+_AUTHOR_CITATION_CACHE: dict[str, tuple[str, str] | None] = {}
 
 
 def _get_http_session() -> requests.Session:
@@ -2792,19 +2793,77 @@ def format_one_author(author: str, overrides: dict[str, str]) -> str:
     if is_institution:
         return author.upper()
 
+    def _is_particle_token(tok: str) -> bool:
+        t = tok.lower().strip(".")
+        if t in PARTICLES:
+            return True
+        if "-" in t and t.split("-")[-1] in PARTICLES:
+            return True
+        return False
+
+    def _is_ambiguous_person_name(ts: list[str]) -> bool:
+        if len(ts) < 2:
+            return True
+        # Casos com particulas/hifenacoes no miolo frequentemente sao ambiguos
+        # sem fonte bibliografica confiavel.
+        for mid in ts[1:-1]:
+            m = mid.lower().strip(".")
+            if m in PARTICLES or ("-" in m and any(x in PARTICLES for x in m.split("-"))):
+                return True
+        if any(re.fullmatch(r"[A-ZÀ-Ý]\.", t, re.I) for t in ts[:1]):
+            return True
+        return False
+
+    def _resolve_author_name_parts_from_web(raw: str) -> tuple[str, str] | None:
+        key = normalize_for_match(raw)
+        if not key:
+            return None
+        if key in _AUTHOR_CITATION_CACHE:
+            return _AUTHOR_CITATION_CACHE[key]
+        try:
+            session = _get_http_session()
+            r = session.get(
+                "https://api.crossref.org/works",
+                params={"query.author": raw, "rows": 5},
+                timeout=6,
+            )
+            r.raise_for_status()
+            data = r.json()
+            items = ((data or {}).get("message", {}) or {}).get("items", []) or []
+            for it in items[:5]:
+                for a in (it.get("author") or [])[:6]:
+                    fam = compact_spaces(str(a.get("family") or ""))
+                    giv = compact_spaces(str(a.get("given") or ""))
+                    if not fam:
+                        continue
+                    cand = normalize_for_match(f"{giv} {fam}")
+                    if cand and (key in cand or cand in key):
+                        _AUTHOR_CITATION_CACHE[key] = (fam, giv)
+                        return _AUTHOR_CITATION_CACHE[key]
+        except Exception:
+            pass
+        _AUTHOR_CITATION_CACHE[key] = None
+        return None
+
+    web_parts = _resolve_author_name_parts_from_web(author) if _is_ambiguous_person_name(tokens) else None
+    if web_parts:
+        fam, giv = web_parts
+        return f"{fam.upper()}, {giv}" if giv else fam.upper()
+
+    # Sem confiança suficiente (nem heurística forte, nem citação confiável),
+    # preserva nome completo sem vírgula.
+    if _is_ambiguous_person_name(tokens):
+        return author
+
     last_parts = [tokens[-1]]
     i = len(tokens) - 2
-
-    while i >= 0 and tokens[i].lower().strip(".") in PARTICLES:
+    while i >= 0 and _is_particle_token(tokens[i]):
         last_parts.insert(0, tokens[i])
         i -= 1
-
     surname = " ".join(last_parts)
     given = " ".join(tokens[: i + 1])
-
     if given:
         return f"{surname.upper()}, {given}"
-
     return surname.upper()
 
 

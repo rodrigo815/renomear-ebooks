@@ -92,12 +92,13 @@ Os erros reportados se concentram em **7 grupos de causa**:
 - ✅ C7: sufixos de volume normalizados para `Vol. N` e ajuste pontual em `Cadernos do Cárcere`.
 - ✅ C1: guardrails extras para anos remotos muito antigos/outliers.
 - ✅ C6: heurística inicial para periódico/revista sem autor pessoal.
-- ⚠️ C4/C5: ainda há casos pendentes, mantidos como regressões diagnósticas.
+- ✅ C4: sobrenome composto hifenizado com partícula (ex.: Engel-Di Mauro) tratado na formatação.
+- ✅ C5: recuperação de autor sem nome explícito validada no fluxo de lookup remoto por título.
 
 ## Testes unitários de diagnóstico
 
 Arquivo: `tests/test_error_causes_diagnostics.py`
 
 - Contém casos por causa (C1..C7).
-- Casos já corrigidos estão como testes normais.
-- Casos ainda pendentes permanecem como `xfail` para rastrear progresso sem perder visibilidade.
+- Casos corrigidos estão como testes normais.
+- Não há pendências `xfail` nesta suíte diagnóstica após os patches finais de C4/C5.
