@@ -5,6 +5,7 @@ import concurrent.futures
 import csv
 import difflib
 import os
+import shutil
 from collections import defaultdict
 import hashlib
 import json
@@ -311,7 +312,11 @@ def author_looks_bad(author: str) -> bool:
     if re.fullmatch(r"[A-Z0-9]{6,}", a):
         return True
     toks = a.split()
-    if len(toks) >= 4 and re.search(r"\b(?:da|de|do|dos|das|the|of|and|e)\b", a, re.I):
+    if (
+        len(toks) >= 6
+        and toks[0].lower().strip(".'’") in {"o", "a", "os", "as", "the", "el", "la", "los", "las"}
+        and re.search(r"\b(?:da|de|do|dos|das|the|of|and|e)\b", a, re.I)
+    ):
         return True
     return False
 
@@ -500,6 +505,16 @@ def authors_list_looks_bad(authors: list[str] | None) -> bool:
 
 def dedupe_authors(authors: list[str]) -> list[str]:
     def _author_sig(a: str) -> tuple[str, str]:
+        a = compact_spaces(a)
+        if not a:
+            return "", ""
+        if "," in a:
+            before, after = [compact_spaces(x) for x in a.split(",", 1)]
+            sb = normalize_for_match(before).split()
+            sa = normalize_for_match(after).split()
+            surname = " ".join(sb) if sb else ""
+            first = sa[0][0] if sa and sa[0] else ""
+            return surname, first
         toks = normalize_for_match(a).split()
         if not toks:
             return "", ""
@@ -508,8 +523,27 @@ def dedupe_authors(authors: list[str]) -> list[str]:
         return surname, first
 
     def _author_richness(a: str) -> tuple[int, int]:
+        if "," in a:
+            before, after = [compact_spaces(x) for x in a.split(",", 1)]
+            b = normalize_for_match(before).split()
+            c = normalize_for_match(after).split()
+            initials = sum(1 for t in c if len(t) == 1)
+            # Prefere nome dado mais completo (menos iniciais).
+            return (len(b) + len(c), len("".join(b + c)) - initials * 2)
         toks = normalize_for_match(a).split()
-        return (len(toks), len("".join(toks)))
+        initials = sum(1 for t in toks[:-1] if len(t) == 1)
+        return (len(toks), len("".join(toks)) - initials * 2)
+
+    def _is_initials_heavy(a: str) -> bool:
+        if "," in a:
+            _before, after = [compact_spaces(x) for x in a.split(",", 1)]
+            toks = normalize_for_match(after).split()
+        else:
+            toks = normalize_for_match(a).split()[:-1]
+        if not toks:
+            return False
+        initials = sum(1 for t in toks if len(t) == 1)
+        return initials >= max(1, len(toks))
 
     out: list[str] = []
     norms: list[str] = []
@@ -534,6 +568,13 @@ def dedupe_authors(authors: list[str]) -> list[str]:
                     norms[i] = n
                 replaced = True
                 break
+            if sig[0] and sig[0] == psig[0]:
+                if _is_initials_heavy(a) != _is_initials_heavy(prev):
+                    if _author_richness(a) > _author_richness(prev):
+                        out[i] = a
+                        norms[i] = n
+                    replaced = True
+                    break
         if replaced:
             continue
         out.append(a)
@@ -684,6 +725,15 @@ SEARCH_SPEED_TO_SOURCES: dict[int, frozenset[str]] = {
     3: frozenset({"openlibrary", "google", "skoob", "catalogs"}),
     4: frozenset({"openlibrary", "google", "skoob"}),
     5: frozenset({"openlibrary", "google"}),
+}
+
+REMOTE_SOURCE_COST_ESTIMATE: dict[str, float] = {
+    "openlibrary": 0.0001,
+    "google": 0.0002,
+    "skoob": 0.0002,
+    "catalogs": 0.0002,
+    "wikipedia": 0.0001,
+    "web": 0.0002,
 }
 
 
@@ -1150,9 +1200,9 @@ def _resolve_two_segments_to_authors_and_title(left: str, right: str) -> tuple[l
             return False
         if re.search(r"\b(?:review|journal|magazine|bulletin|volume|vol\.?)\b", s, re.I):
             return False
-        if re.search(r"\b(?:and|e|of|do|da|de|dos|das)\b", s, re.I) and len(s.split()) >= 3:
+        if re.search(r"\b(?:and|e|of)\b", s, re.I) and len(s.split()) >= 3:
             return False
-        if not (1 <= len(toks) <= 4):
+        if not (1 <= len(toks) <= 6):
             return False
         return bool(re.search(r"[A-Za-zÀ-ÿ]", s))
 
@@ -1646,6 +1696,8 @@ def read_local_metadata(path: Path, max_pdf_pages: int, year_strategy: str = "or
         candidate_authors = prefer_author_order(candidate_authors, fallback_authors[0])
 
         merged = fallback_authors[:]
+        fb_last = normalize_for_match(fallback_authors[0]).split()
+        fb_last_tok = fb_last[-1] if fb_last else ""
         for a in candidate_authors:
             if _looks_like_translator_credit(a):
                 continue
@@ -1655,6 +1707,11 @@ def read_local_metadata(path: Path, max_pdf_pages: int, year_strategy: str = "or
             if len(fallback_authors) == 1:
                 fb = normalize_for_match(fallback_authors[0])
                 if fb and fuzz.token_set_ratio(na, fb) < 42:
+                    continue
+                # Evita anexar autor remoto/local extra quando o sobrenome diverge.
+                cand_toks = na.split()
+                cand_last = cand_toks[-1] if cand_toks else ""
+                if fb_last_tok and cand_last and fuzz.ratio(cand_last, fb_last_tok) < 88:
                     continue
             merged.append(a)
         merged = dedupe_authors(merged)
@@ -2394,25 +2451,35 @@ def merge_metadata(
     # --- title ---
     if "title" in klf:
         out.title = (local.title if local_nonempty_title() else "") or (remote.title or "") or ""
+        append_note(out, "decision:title=local_keep")
     elif "title" not in rmf:
         out.title = local.title or remote.title or ""
+        append_note(out, "decision:title=local_priority")
     else:
         if force_remote_core and remote.title:
             out.title = remote.title
+            append_note(out, "decision:title=remote_forced_by_suspicious_local")
         else:
             out.title = (
                 remote.title
                 if prefer_remote_title and remote.title
                 else (local.title or remote.title or "")
             )
+            if prefer_remote_title and remote.title:
+                append_note(out, "decision:title=remote_preferred")
+            else:
+                append_note(out, "decision:title=local_if_present")
 
     # --- authors ---
     if "authors" in klf:
         out.authors = list(local_authors) if local_authors else list(remote_authors or [])
+        append_note(out, "decision:authors=local_keep")
     elif "authors" not in rmf:
         out.authors = list(local_authors) if local_authors else list(remote_authors or [])
+        append_note(out, "decision:authors=local_priority")
     elif force_remote_core:
         out.authors = list(remote_authors)
+        append_note(out, "decision:authors=remote_forced_by_suspicious_local")
     elif (
         local_authors
         and remote_authors
@@ -2422,22 +2489,29 @@ def merge_metadata(
     ):
         out.authors = list(local_authors)
         append_note(out, "guardrail: autor remoto bloqueado por incompatibilidade com nome local")
+        append_note(out, "decision:authors=local_guardrail_incompatibility")
     elif local_authors and remote_authors and authors_need_enrichment(local_authors):
         if surnames_compatible(local_authors, remote_authors):
             out.authors = list(remote_authors)
+            append_note(out, "decision:authors=remote_enrichment_compatible")
         else:
             out.authors = list(local_authors)
+            append_note(out, "decision:authors=local_enrichment_incompatible")
     else:
         out.authors = list(local_authors or remote_authors or [])
+        append_note(out, "decision:authors=fallback_local_or_remote")
 
     # --- year ---
     if "year" in klf:
         out.year = (local.year if local_nonempty_year() else "") or (remote.year or "") or ""
+        append_note(out, "decision:year=local_keep")
     elif "year" not in rmf:
         out.year = local.year or remote.year or ""
+        append_note(out, "decision:year=local_priority")
     else:
         if bool(getattr(local, "filename_paren_year", False)) and local_nonempty_year():
             out.year = local.year
+            append_note(out, "decision:year=local_filename_paren")
         else:
             ry = compact_spaces(remote.year or "")
             ly = compact_spaces(local.year or "")
@@ -2447,14 +2521,18 @@ def merge_metadata(
                 if abs(ryi - lyi) >= 80 or (ryi < 1700 <= lyi):
                     out.year = ly
                     append_note(out, f"guardrail: ano remoto outlier ({ry}) ignorado")
+                    append_note(out, "decision:year=local_guardrail_outlier")
                 else:
                     out.year = ry
+                    append_note(out, "decision:year=remote_with_guardrail_check")
             else:
                 if ry and is_year_token(ry) and int(ry) < 1700:
                     out.year = ly or ""
                     append_note(out, f"guardrail: ano remoto muito antigo ({ry}) ignorado")
+                    append_note(out, "decision:year=local_guardrail_ancient_remote")
                 else:
                     out.year = ry or ly or ""
+                    append_note(out, "decision:year=remote_or_local_fallback")
 
     # --- isbn ---
     if "isbn" in klf:
@@ -2984,6 +3062,51 @@ def _append_filename_extra_suffix_to_fullname(full_name: str, extra: str) -> str
     return new_stem + p.suffix.lower()
 
 
+def _normalize_final_filename(name: str) -> str:
+    """Normalizacao final unica para todos os caminhos de nomeacao."""
+    p = Path(name)
+    stem = compact_spaces(p.stem)
+    stem = re.sub(r"\s{2,}", " ", stem)
+    stem = re.sub(r"\s*-\s*-\s*", " - ", stem)
+    stem = re.sub(r"\s*[-,;:.]{2,}\s*", " - ", stem)
+    stem = re.sub(r"^\s*[-,;:.]+\s*", "", stem)
+    stem = re.sub(r"\s*[-,;:.]+\s*$", "", stem)
+    stem = re.sub(r"\(\s*\)", "", stem)
+    stem = compact_spaces(stem).strip(" -.;,:")
+    stem = safe_filename_part(stem, max_len=200)
+    if not stem or stem == "sem_nome":
+        stem = "sem_nome"
+    return stem + p.suffix.lower()
+
+
+def classify_item_kind(path: Path, local: BookMeta, meta: BookMeta) -> tuple[str, float]:
+    """Classifica item em book/article/magazine/report/unknown."""
+    txt = normalize_for_match(
+        " ".join(
+            [
+                path.stem or "",
+                local.title or "",
+                meta.title or "",
+                meta.publisher or "",
+                " ".join(meta.authors or []),
+            ]
+        )
+    )
+    if not txt:
+        return "unknown", 0.2
+    if re.search(r"\b(cia|report|information report|technical report|white paper)\b", txt):
+        return "report", 0.85
+    if re.search(r"\b(review|journal|proceedings|paper|article)\b", txt):
+        return "article", 0.72
+    if re.search(r"\b(vol\.?|volume|no\.?|n\.|issue|revista|magazine)\b", txt):
+        return "magazine", 0.7
+    if (meta.authors and meta.title) or (local.authors and local.title):
+        return "book", 0.72
+    if meta.title or local.title:
+        return "unknown", 0.45
+    return "unknown", 0.2
+
+
 def make_new_filename(
     meta: BookMeta,
     ext: str,
@@ -2992,14 +3115,25 @@ def make_new_filename(
     unknown_year: str,
     filename_pattern: str = "",
     unknown_year_label: str = "s.d.",
+    item_kind: str = "book",
 ) -> str:
     ext_l = ext.lower()
     if not ext_l.startswith("."):
         ext_l = "." + ext_l
 
     pattern = compact_spaces(filename_pattern)
+    if item_kind in {"article", "magazine", "report"}:
+        title_fmt = safe_filename_part(title_for_filename(meta), max_len=150)
+        year_fmt = meta.year or (
+            unknown_year_placeholder(unknown_year, unknown_year_label)
+            if unknown_year == "sd"
+            else ""
+        )
+        if year_fmt:
+            return _normalize_final_filename(f"{title_fmt} - {year_fmt}{ext_l}")
+        return _normalize_final_filename(f"{title_fmt}{ext_l}")
     if not pattern:
-        return (
+        return _normalize_final_filename(
             default_filename_stem(
                 meta, overrides, max_authors, unknown_year, unknown_year_label=unknown_year_label
             )
@@ -3041,7 +3175,7 @@ def make_new_filename(
     stem = safe_filename_part(stem, max_len=200)
 
     if not stem or stem == "sem_nome":
-        return (
+        return _normalize_final_filename(
             default_filename_stem(
                 meta, overrides, max_authors, unknown_year, unknown_year_label=unknown_year_label
             )
@@ -3051,7 +3185,9 @@ def make_new_filename(
     if not has_format:
         stem = stem + ext_l
 
-    return _append_filename_extra_suffix_to_fullname(stem, meta.filename_extra_suffix or "")
+    return _normalize_final_filename(
+        _append_filename_extra_suffix_to_fullname(stem, meta.filename_extra_suffix or "")
+    )
 
 
 def unique_target(src: Path, filename: str, target_dir: Path, reserved: set[Path]) -> Path:
@@ -3911,6 +4047,40 @@ def _write_review_needed_csv(
     return review_path_out
 
 
+def _write_deep_review_csv(
+    output_dir: Path, args: argparse.Namespace, deep_review_rows: list[dict[str, str]]
+) -> Path | None:
+    if not getattr(args, "deep_review", False):
+        return None
+    p = output_dir / "deep_review.csv"
+    with p.open("w", encoding="utf-8-sig", newline="") as f:
+        w = csv.DictWriter(
+            f,
+            fieldnames=[
+                "original",
+                "novo_sugerido",
+                "status",
+                "pontuacao",
+                "faixa",
+                "escolha_revisao",
+                "local_titulo",
+                "local_autores",
+                "local_ano",
+                "final_titulo",
+                "final_autores",
+                "final_ano",
+                "fonte",
+                "evidencias",
+                "source_failures",
+                "notas",
+            ],
+        )
+        w.writeheader()
+        for row in deep_review_rows:
+            w.writerow(_csv_safe_row(row))
+    return p
+
+
 def _write_missing_year_csv(
     output_dir: Path, args: argparse.Namespace, missing_year_rows: list[dict[str, str]]
 ) -> Path | None:
@@ -3939,6 +4109,251 @@ def _write_missing_year_csv(
     return missing_path
 
 
+def _write_run_summary_md(output_dir: Path, rows: list[dict[str, str]], total: int) -> Path:
+    failures_by_source: defaultdict[str, int] = defaultdict(int)
+    reasons: defaultdict[str, int] = defaultdict(int)
+    ambiguity_patterns: defaultdict[str, int] = defaultdict(int)
+    status_counts: defaultdict[str, int] = defaultdict(int)
+    for r in rows:
+        st = compact_spaces(r.get("status", ""))
+        status_counts[st] += 1
+        notas = normalize_for_match(r.get("notas", ""))
+        if "conservador" in notas:
+            ambiguity_patterns["decisao_conservadora"] += 1
+        if "kind=unknown" in notas:
+            ambiguity_patterns["item_kind_unknown"] += 1
+        rawf = r.get("source_failures", "")
+        try:
+            fl = json.loads(rawf) if rawf else []
+        except Exception:
+            fl = []
+        for f in fl or []:
+            src = compact_spaces(str((f or {}).get("source", "?"))) or "?"
+            rsn = compact_spaces(str((f or {}).get("reason", "unknown"))) or "unknown"
+            failures_by_source[src] += 1
+            reasons[rsn] += 1
+    lines = [
+        "# Run Summary",
+        "",
+        f"- Total processado: {total}",
+        f"- Renomeado: {status_counts.get('renomeado', 0)}",
+        f"- Revisao necessaria: {status_counts.get('revisao_necessaria', 0)}",
+        f"- Skipped/revisao: {status_counts.get('pulado_revisao', 0)}",
+        "",
+        "## Falhas externas por fonte",
+    ]
+    if failures_by_source:
+        for k, v in sorted(failures_by_source.items(), key=lambda kv: kv[1], reverse=True):
+            lines.append(f"- {k}: {v}")
+    else:
+        lines.append("- nenhuma")
+    lines.append("")
+    lines.append("## Top causas de erro")
+    if reasons:
+        for k, v in sorted(reasons.items(), key=lambda kv: kv[1], reverse=True)[:10]:
+            lines.append(f"- {k}: {v}")
+    else:
+        lines.append("- nenhuma")
+    lines.append("")
+    lines.append("## Top padroes de ambiguidade")
+    if ambiguity_patterns:
+        for k, v in sorted(ambiguity_patterns.items(), key=lambda kv: kv[1], reverse=True)[:10]:
+            lines.append(f"- {k}: {v}")
+    else:
+        lines.append("- nenhum")
+    p = output_dir / "run_summary.md"
+    p.write_text("\n".join(lines).rstrip() + "\n", encoding="utf-8")
+    return p
+
+
+def _ensure_quarantine_dirs(output_dir: Path, enabled: bool) -> dict[str, Path]:
+    q = {
+        "originals": output_dir / "originals",
+        "failed": output_dir / "failed",
+        "converted": output_dir / "converted",
+    }
+    if enabled:
+        for p in q.values():
+            p.mkdir(parents=True, exist_ok=True)
+    return q
+
+
+def _copy_to_quarantine_original(path: Path, qdirs: dict[str, Path], enabled: bool) -> Path | None:
+    if not enabled:
+        return None
+    dst = unique_target(path, path.name, qdirs["originals"], set())
+    try:
+        shutil.copy2(path, dst)
+        return dst
+    except OSError:
+        return None
+
+
+def _move_to_quarantine_failed(
+    path: Path, qdirs: dict[str, Path], enabled: bool, reserved: set[Path]
+) -> Path | None:
+    if not enabled:
+        return None
+    dst = unique_target(path, path.name, qdirs["failed"], reserved)
+    try:
+        path.rename(dst)
+        return dst
+    except OSError:
+        return None
+
+
+def _load_author_aliases_for_root(folder: Path, args: argparse.Namespace) -> dict[str, str]:
+    raw = compact_spaces(getattr(args, "author_aliases", "") or "")
+    if not raw:
+        return {}
+    p = Path(raw)
+    if not p.is_absolute():
+        p = (folder / p).resolve()
+    if not p.exists():
+        return {}
+    try:
+        data = json.loads(p.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+    out: dict[str, str] = {}
+    if isinstance(data, dict):
+        for k, v in data.items():
+            kk = normalize_for_match(str(k))
+            vv = compact_spaces(str(v))
+            if kk and vv:
+                out[kk] = vv
+    return out
+
+
+def _apply_author_aliases(meta: BookMeta, local: BookMeta, aliases: dict[str, str]) -> BookMeta:
+    if not aliases or not meta.authors:
+        return meta
+    # Nao sobrescrever autor local forte sem convergencia.
+    local_strong = bool(local.authors) and float(local.confidence or 0.0) >= 0.6
+    local_norm = {normalize_for_match(a) for a in (local.authors or [])}
+    changed = False
+    out_auth: list[str] = []
+    for a in meta.authors:
+        nk = normalize_for_match(a)
+        target = aliases.get(nk)
+        if target:
+            if local_strong and nk not in local_norm:
+                out_auth.append(a)
+            else:
+                out_auth.append(target)
+                changed = True
+        else:
+            out_auth.append(a)
+    if changed:
+        meta.authors = dedupe_authors(out_auth)
+        append_note(meta, "author_alias_applied")
+    return meta
+
+
+def _estimate_sources_cost(sources: frozenset[str]) -> float:
+    return round(sum(REMOTE_SOURCE_COST_ESTIMATE.get(s, 0.0002) for s in sources), 6)
+
+
+def _risk_recommendation(meta: BookMeta, item_kind: str, item_kind_conf: float) -> tuple[str, str]:
+    band = _review_band(meta.match_score)
+    if item_kind_conf < 0.6:
+        return "high", "revisar_manual"
+    if band == "duvidoso":
+        return "high", "revisar_manual"
+    if band == "revisar":
+        return "medium", "revisar_manual"
+    if item_kind in {"article", "magazine", "report"}:
+        return "medium", "nome_conservador"
+    return "low", "aplicar_ou_simular"
+
+
+def _extract_signals_for_item(
+    path: Path,
+    local: BookMeta,
+    args: argparse.Namespace,
+    cache: dict[str, Any],
+    sup_index: SupplementaryIndex,
+    author_aliases: dict[str, str],
+) -> tuple[BookMeta, dict[str, Any]]:
+    """Fase A: extrai sinais locais/remotos/suplementares."""
+    local_norm = prioritize_triplet_filename_over_local(local, path)
+    should_use_offline = _should_use_offline_lookup(local_norm, path, args)
+    conservative_reasons: list[str] = []
+    budget_spent = float(getattr(args, "_estimated_cost_spent", 0.0) or 0.0)
+    max_budget = float(getattr(args, "max_estimated_cost", 0.0) or 0.0)
+    enabled_sources = frozenset(args.enabled_remote_sources)
+    max_calls = int(getattr(args, "max_remote_calls_per_file", 0) or 0)
+    if max_calls > 0:
+        enabled_sources = frozenset(list(REMOTE_SOURCE_KEYS)[:max_calls]) & enabled_sources
+        conservative_reasons.append(f"max_remote_calls_per_file={max_calls}")
+    estimated_item_cost = _estimate_sources_cost(enabled_sources)
+    if max_budget > 0 and (budget_spent + estimated_item_cost > max_budget):
+        should_use_offline = True
+        conservative_reasons.append("max_estimated_cost_exceeded")
+
+    t0 = time.monotonic()
+    if should_use_offline:
+        meta = local_norm
+    else:
+        meta = lookup_metadata(
+            local_norm,
+            enabled_sources,
+            cache,
+            sleep_s=args.effective_sleep,
+            prefer_remote_title=args.prefer_remote_title,
+            year_strategy=args.year_strategy,
+            skip_author_enrich=args.skip_author_enrich,
+            remote_merge_fields=args.remote_merge_fields,
+            keep_local_metadata=args.keep_local_metadata_fields,
+        )
+        setattr(args, "_estimated_cost_spent", budget_spent + estimated_item_cost)
+    item_elapsed_s = time.monotonic() - t0
+    timeout_s = float(getattr(args, "item_timeout_s", 0.0) or 0.0)
+    if timeout_s > 0 and item_elapsed_s > timeout_s:
+        meta = local_norm
+        conservative_reasons.append(f"item_timeout_s_exceeded:{item_elapsed_s:.2f}s")
+    meta = apply_supplementary_merged(local_norm, meta, sup_index, args)
+    meta = patch_meta_from_filename_if_merged_suspect(path, meta)
+    meta = _apply_author_aliases(meta, local_norm, author_aliases)
+    ms, evd = compute_match_evidence(local_norm, meta)
+    if sup_index and "supplement" in (meta.source or "").lower():
+        evd["suplemento"] = f"ficheiro: {Path(sup_index.label).name}"
+    meta.match_score = ms
+    meta.evidence = evd
+    kind, kind_conf = classify_item_kind(path, local_norm, meta)
+    if conservative_reasons:
+        append_note(meta, "decisao_conservadora: " + ", ".join(conservative_reasons))
+    risk_level, recommendation = _risk_recommendation(meta, kind, kind_conf)
+    signals = {
+        "path": str(path),
+        "local": {
+            "title": local_norm.title,
+            "authors": list(local_norm.authors or []),
+            "year": local_norm.year,
+            "source": local_norm.source,
+        },
+        "remote_or_merged": {
+            "title": meta.title,
+            "authors": list(meta.authors or []),
+            "year": meta.year,
+            "source": meta.source,
+            "confidence": meta.confidence,
+            "match_score": meta.match_score,
+            "source_failures": list(getattr(meta, "source_failures", []) or []),
+            "evidence": dict(meta.evidence or {}),
+        },
+        "item_kind": kind,
+        "item_kind_confidence": kind_conf,
+        "used_offline_lookup": should_use_offline,
+        "item_elapsed_s": round(item_elapsed_s, 4),
+        "estimated_item_cost": estimated_item_cost,
+        "risk_level": risk_level,
+        "recommendation": recommendation,
+        "conservative_reasons": conservative_reasons,
+    }
+    return meta, signals
+
+
 def run_on_root(
     folder: Path, args: argparse.Namespace
 ) -> tuple[int, int, Path, Path, Path | None, Path | None]:
@@ -3948,39 +4363,26 @@ def run_on_root(
     cache_path = output_dir / "metadata_cache.json"
     plan_path = output_dir / ("rename_log.csv" if args.apply else "rename_plan.csv")
     cache, overrides, sup_index = _load_root_inputs(folder, args, cache_path)
+    author_aliases = _load_author_aliases_for_root(folder, args)
     local_pairs = _collect_local_pairs_for_root(folder, output_dir, args)
+    qdirs = _ensure_quarantine_dirs(output_dir, bool(getattr(args, "quarantine", False)))
+    phase_artifacts: list[dict[str, Any]] = []
 
     reserved: set[Path] = set()
     rows: list[dict[str, str]] = []
     missing_year_rows: list[dict[str, str]] = []
     missing_year_count = 0
     review_needed_rows: list[dict[str, str]] = []
+    deep_review_rows: list[dict[str, str]] = []
     catalog_entries: list[dict[str, Any]] = []
+    q_reserved: set[Path] = set()
 
     for path, local in local_pairs:
+        meta, signals = _extract_signals_for_item(path, local, args, cache, sup_index, author_aliases)
         local = prioritize_triplet_filename_over_local(local, path)
-        should_use_offline = _should_use_offline_lookup(local, path, args)
-        if should_use_offline:
-            meta = local
-        else:
-            meta = lookup_metadata(
-                local,
-                args.enabled_remote_sources,
-                cache,
-                sleep_s=args.effective_sleep,
-                prefer_remote_title=args.prefer_remote_title,
-                year_strategy=args.year_strategy,
-                skip_author_enrich=args.skip_author_enrich,
-                remote_merge_fields=args.remote_merge_fields,
-                keep_local_metadata=args.keep_local_metadata_fields,
-            )
-        meta = apply_supplementary_merged(local, meta, sup_index, args)
-        meta = patch_meta_from_filename_if_merged_suspect(path, meta)
-        ms, evd = compute_match_evidence(local, meta)
-        if sup_index and "supplement" in (meta.source or "").lower():
-            evd["suplemento"] = f"ficheiro: {Path(sup_index.label).name}"
-        meta.match_score = ms
-        meta.evidence = evd
+        phase_artifacts.append(signals)
+        item_kind = str(signals.get("item_kind") or "book")
+        item_kind_conf = float(signals.get("item_kind_confidence") or 0.0)
 
         eo: dict[str, str] = dict(overrides)
         if getattr(args, "review_author_lock", None):
@@ -3994,14 +4396,25 @@ def run_on_root(
             args.unknown_year,
             filename_pattern=args.filename_pattern,
             unknown_year_label=args.unknown_year_text,
+            item_kind=item_kind,
         )
 
         target = unique_target(path, new_name, output_dir, reserved)
         review_choice = "auto"
         band = _review_band(meta.match_score)
-        failure_review_required = bool(getattr(meta, "source_failures", [])) and band != "auto"
+        conservative_flag = "decisao_conservadora" in normalize_for_match(meta.notes or "")
+        failure_review_required = (
+            bool(getattr(meta, "source_failures", []))
+            and band != "auto"
+            and getattr(args, "execution_profile", "balanced") != "aggressive"
+        )
+        weak_kind_review_required = item_kind_conf < 0.6
 
-        if getattr(args, "review", False) and not should_use_offline and band != "auto":
+        review_all = bool(getattr(args, "deep_review", False))
+        should_open_review = bool(getattr(args, "review", False)) and (review_all or band != "auto")
+        if getattr(args, "execution_profile", "balanced") == "safe":
+            should_open_review = True
+        if should_open_review:
             reserved.discard(target)
             new_name, target, review_choice = interactive_review_item(
                 path,
@@ -4021,6 +4434,15 @@ def run_on_root(
         if failure_review_required and status == "planejado":
             status = "revisao_necessaria"
             review_choice = "review_required"
+        if weak_kind_review_required and status == "planejado":
+            status = "revisao_necessaria"
+            review_choice = "review_required_kind_unknown"
+        if conservative_flag and status == "planejado":
+            status = "revisao_necessaria"
+            review_choice = "conservative_fallback"
+        if getattr(args, "safe_require_manual", False) and band != "auto" and status == "planejado":
+            status = "revisao_necessaria"
+            review_choice = "safe_profile_manual_required"
         if review_choice == "skip":
             status = "pulado_revisao"
             new_name = path.name
@@ -4030,10 +4452,29 @@ def run_on_root(
 
         if args.apply and status == "planejado":
             try:
+                _copy_to_quarantine_original(path, qdirs, bool(getattr(args, "quarantine", False)))
                 path.rename(target)
                 status = "renomeado"
             except OSError as e:
                 status = f"erro: {e}"
+        if (
+            args.apply
+            and bool(getattr(args, "quarantine", False))
+            and status == "revisao_necessaria"
+            and bool(getattr(meta, "source_failures", []))
+        ):
+            failed_path = _move_to_quarantine_failed(path, qdirs, True, q_reserved)
+            if failed_path is not None:
+                status = f"falha_consulta_movida_quarantine: {failed_path}"
+        if status.startswith("erro"):
+            failed_path = _move_to_quarantine_failed(
+                path,
+                qdirs,
+                bool(getattr(args, "quarantine", False)),
+                q_reserved,
+            )
+            if failed_path is not None:
+                status = f"falha_movida_quarantine: {failed_path}"
 
         rows.append(
             {
@@ -4049,7 +4490,7 @@ def run_on_root(
                 "pontuacao": str(meta.match_score),
                 "evidencias": json.dumps(meta.evidence or {}, ensure_ascii=False),
                 "source_failures": json.dumps(getattr(meta, "source_failures", []) or [], ensure_ascii=False),
-                "notas": meta.notes,
+                "notas": compact_spaces(f"{meta.notes} | kind={item_kind} conf={item_kind_conf:.2f}"),
             }
         )
 
@@ -4078,7 +4519,7 @@ def run_on_root(
         if not args.quiet:
             log_info(line)
 
-        if getattr(args, "review", False) and band != "auto":
+        if getattr(args, "review", False) and (review_all or band != "auto"):
             review_needed_rows.append(
                 {
                     "original": str(path),
@@ -4090,6 +4531,27 @@ def run_on_root(
                     "autores": "; ".join(meta.authors or []),
                     "evidencias": json.dumps(meta.evidence or {}, ensure_ascii=False),
                     "source_failures": json.dumps(getattr(meta, "source_failures", []) or [], ensure_ascii=False),
+                }
+            )
+        if review_all:
+            deep_review_rows.append(
+                {
+                    "original": str(path),
+                    "novo_sugerido": str(target) if review_choice != "skip" else "",
+                    "status": status,
+                    "pontuacao": str(meta.match_score),
+                    "faixa": band,
+                    "escolha_revisao": review_choice,
+                    "local_titulo": local.title,
+                    "local_autores": "; ".join(local.authors or []),
+                    "local_ano": local.year,
+                    "final_titulo": meta.title,
+                    "final_autores": "; ".join(meta.authors or []),
+                    "final_ano": meta.year,
+                    "fonte": meta.source,
+                    "evidencias": json.dumps(meta.evidence or {}, ensure_ascii=False),
+                    "source_failures": json.dumps(getattr(meta, "source_failures", []) or [], ensure_ascii=False),
+                    "notas": meta.notes,
                 }
             )
 
@@ -4118,8 +4580,11 @@ def run_on_root(
             )
 
     save_json(cache_path, cache)
+    save_json(output_dir / "phase_artifacts.json", {"items": phase_artifacts})
     _write_plan_csv(plan_path, rows)
+    summary_path = _write_run_summary_md(output_dir, rows, len(rows))
     review_path_out = _write_review_needed_csv(output_dir, args, review_needed_rows)
+    deep_review_path = _write_deep_review_csv(output_dir, args, deep_review_rows)
     missing_path = _write_missing_year_csv(output_dir, args, missing_year_rows)
 
     if getattr(args, "generate_catalog", False):
@@ -4130,8 +4595,218 @@ def run_on_root(
         ):
             if not args.quiet:
                 log_info(f"Catalogo salvo em: {wp}")
+    if deep_review_path is not None and not args.quiet:
+        log_info(f"Revisao profunda (CSV): {deep_review_path}")
+    if not args.quiet:
+        log_info(f"Resumo da execucao: {summary_path}")
 
     return len(rows), missing_year_count, plan_path, cache_path, missing_path, review_path_out
+
+
+def _deep_analysis_fallback_payload(meta: BookMeta) -> dict[str, Any]:
+    band = _review_band(meta.match_score)
+    return {
+        "risk": f"divergencia local/remoto na faixa {band}",
+        "likely_cause": "heuristica de merge/parsing em conflito com metadado remoto",
+        "action": "revisar autores/titulo manualmente antes de aplicar",
+        "confidence": round(float(meta.confidence or 0.0), 3),
+        "notes": "fallback_heuristico_local",
+    }
+
+
+def _coerce_deep_analysis_json(payload: Any, meta: BookMeta) -> dict[str, Any]:
+    req = ["risk", "likely_cause", "action", "confidence", "notes"]
+    if not isinstance(payload, dict):
+        return _deep_analysis_fallback_payload(meta)
+    out = dict(payload)
+    for k in req:
+        if k not in out:
+            return _deep_analysis_fallback_payload(meta)
+    try:
+        out["confidence"] = float(out.get("confidence"))
+    except Exception:
+        out["confidence"] = float(meta.confidence or 0.0)
+    for k in ("risk", "likely_cause", "action", "notes"):
+        out[k] = compact_spaces(str(out.get(k, "")))
+    return out
+
+
+def _deep_analysis_ai_for_item(
+    path: Path, local: BookMeta, meta: BookMeta, should_use_offline: bool
+) -> dict[str, Any]:
+    """Gera parecer de IA em JSON estrito; se falhar, usa fallback heuristico local."""
+    api_key = compact_spaces(os.getenv("DEEP_ANALYSIS_API_KEY", ""))
+    api_url = compact_spaces(
+        os.getenv("DEEP_ANALYSIS_API_URL", "https://openrouter.ai/api/v1/chat/completions")
+    )
+    model = compact_spaces(os.getenv("DEEP_ANALYSIS_MODEL", "openai/gpt-4o-mini"))
+
+    prompt = (
+        "Analise tecnicamente este e-book para risco de renomeacao incorreta.\n"
+        f"Arquivo: {path.name}\n"
+        f"Modo offline usado: {should_use_offline}\n"
+        f"Local -> titulo={local.title!r}; autores={local.authors or []}; ano={local.year!r}; fonte={local.source!r}\n"
+        f"Final -> titulo={meta.title!r}; autores={meta.authors or []}; ano={meta.year!r}; fonte={meta.source!r}\n"
+        f"Match score={meta.match_score}; confianca={meta.confidence}; evidencias={meta.evidence}; "
+        f"falhas={getattr(meta, 'source_failures', [])}; notas={meta.notes!r}\n"
+        "Responda SOMENTE em JSON valido com campos: "
+        '{"risk":"...", "likely_cause":"...", "action":"...", "confidence":0.0, "notes":"..."}'
+    )
+
+    if not api_key:
+        return _deep_analysis_fallback_payload(meta)
+
+    try:
+        session = _get_http_session()
+        headers = {
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+        }
+        payload = {
+            "model": model,
+            "messages": [
+                {"role": "system", "content": "Voce e um analista bibliografico estrito e conciso."},
+                {"role": "user", "content": prompt},
+            ],
+            "temperature": 0.2,
+        }
+        r = session.post(api_url, headers=headers, json=payload, timeout=20)
+        r.raise_for_status()
+        data = r.json()
+        txt_raw = (
+            (((data or {}).get("choices") or [{}])[0].get("message") or {}).get("content")
+            or ""
+        )
+        txt = txt_raw.replace("\r\n", "\n").replace("\r", "\n").strip()
+        try:
+            parsed = json.loads(txt)
+        except Exception:
+            _register_source_failure(meta.source_failures, "deep_analysis_ai", "invalid_json_payload")
+            return _deep_analysis_fallback_payload(meta)
+        return _coerce_deep_analysis_json(parsed, meta)
+    except Exception as exc:
+        _register_source_failure(meta.source_failures, "deep_analysis_ai", f"request_failed: {type(exc).__name__}")
+        out = _deep_analysis_fallback_payload(meta)
+        out["notes"] = compact_spaces(f"{out.get('notes')} | falha_ia={type(exc).__name__}: {exc}")
+        return out
+
+
+def run_deep_analysis_on_root(folder: Path, args: argparse.Namespace) -> Path:
+    """Analisa item a item (com IA) e grava apenas um Markdown final."""
+    output_dir = _resolve_output_dir_for_root(folder)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    analysis_path = output_dir / "deep_analysis.md"
+    cache_path = output_dir / "metadata_cache.json"
+    cache, _overrides, sup_index = _load_root_inputs(folder, args, cache_path)
+    local_pairs = _collect_local_pairs_for_root(folder, output_dir, args)
+
+    lines: list[str] = []
+    lines.append(f"# Deep Analysis - {folder}")
+    lines.append("")
+    lines.append(f"- Arquivos analisados: {len(local_pairs)}")
+    lines.append(f"- Revisao interativa: {bool(getattr(args, 'deep_analysis_review', False))}")
+    lines.append("")
+
+    for idx, (path, local) in enumerate(local_pairs, start=1):
+        local = prioritize_triplet_filename_over_local(local, path)
+        should_use_offline = _should_use_offline_lookup(local, path, args)
+        if should_use_offline:
+            meta = local
+        else:
+            meta = lookup_metadata(
+                local,
+                args.enabled_remote_sources,
+                cache,
+                sleep_s=args.effective_sleep,
+                prefer_remote_title=args.prefer_remote_title,
+                year_strategy=args.year_strategy,
+                skip_author_enrich=args.skip_author_enrich,
+                remote_merge_fields=args.remote_merge_fields,
+                keep_local_metadata=args.keep_local_metadata_fields,
+            )
+        meta = apply_supplementary_merged(local, meta, sup_index, args)
+        meta = patch_meta_from_filename_if_merged_suspect(path, meta)
+        ms, evd = compute_match_evidence(local, meta)
+        meta.match_score = ms
+        meta.evidence = evd
+
+        ai_payload = _deep_analysis_ai_for_item(path, local, meta, should_use_offline)
+        review_note = ""
+        if getattr(args, "deep_analysis_review", False):
+            try:
+                review_note = input(f"[deep-analysis-review] Comentario para '{path.name}' (ENTER para vazio): ").strip()
+            except EOFError:
+                review_note = ""
+
+        lines.append(f"## {idx}. {path.name}")
+        lines.append("")
+        lines.append(f"- Score: `{meta.match_score}` | Faixa: `{_review_band(meta.match_score)}`")
+        lines.append(f"- Local: autores={local.authors or []}; ano={local.year!r}; titulo={local.title!r}")
+        lines.append(f"- Final: autores={meta.authors or []}; ano={meta.year!r}; titulo={meta.title!r}")
+        lines.append(f"- Fonte: `{meta.source}`")
+        lines.append(f"- Falhas externas: `{getattr(meta, 'source_failures', [])}`")
+        lines.append("")
+        lines.append("### Parecer IA")
+        lines.append("")
+        lines.append(f"- risk: {ai_payload.get('risk', '')}")
+        lines.append(f"- likely_cause: {ai_payload.get('likely_cause', '')}")
+        lines.append(f"- action: {ai_payload.get('action', '')}")
+        lines.append(f"- confidence: {ai_payload.get('confidence', '')}")
+        lines.append(f"- notes: {ai_payload.get('notes', '')}")
+        lines.append("")
+        if review_note:
+            lines.append("### Revisao manual")
+            lines.append("")
+            lines.append(f"- {review_note}")
+            lines.append("")
+
+    analysis_path.write_text("\n".join(lines).rstrip() + "\n", encoding="utf-8")
+    return analysis_path
+
+
+def run_planning_on_root(folder: Path, args: argparse.Namespace) -> tuple[Path, Path]:
+    """Somente planejamento: classifica risco e recomenda acao; nao gera nomes finais."""
+    output_dir = _resolve_output_dir_for_root(folder)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    cache_path = output_dir / "metadata_cache.json"
+    cache, _overrides, sup_index = _load_root_inputs(folder, args, cache_path)
+    author_aliases = _load_author_aliases_for_root(folder, args)
+    local_pairs = _collect_local_pairs_for_root(folder, output_dir, args)
+    items: list[dict[str, Any]] = []
+    md_lines = ["# Planning Only", "", f"- Arquivos analisados: {len(local_pairs)}", ""]
+    for idx, (path, local) in enumerate(local_pairs, start=1):
+        meta, signals = _extract_signals_for_item(path, local, args, cache, sup_index, author_aliases)
+        risk = str(signals.get("risk_level", "medium"))
+        rec = str(signals.get("recommendation", "revisar_manual"))
+        item = {
+            "path": str(path),
+            "risk_level": risk,
+            "recommendation": rec,
+            "item_kind": signals.get("item_kind"),
+            "item_kind_confidence": signals.get("item_kind_confidence"),
+            "match_score": meta.match_score,
+            "confidence": meta.confidence,
+            "notes": meta.notes,
+            "source_failures": list(getattr(meta, "source_failures", []) or []),
+        }
+        items.append(item)
+        md_lines.append(f"## {idx}. {path.name}")
+        md_lines.append("")
+        md_lines.append(f"- risco: `{risk}`")
+        md_lines.append(f"- recomendacao: `{rec}`")
+        md_lines.append(
+            f"- score/conf: `{meta.match_score}` / `{round(float(meta.confidence or 0.0), 3)}`"
+        )
+        md_lines.append(
+            f"- kind: `{signals.get('item_kind')}` ({round(float(signals.get('item_kind_confidence') or 0.0), 3)})"
+        )
+        md_lines.append("")
+    md_path = output_dir / "planning_only.md"
+    json_path = output_dir / "planning_only.json"
+    md_path.write_text("\n".join(md_lines).rstrip() + "\n", encoding="utf-8")
+    save_json(json_path, {"items": items})
+    save_json(cache_path, cache)
+    return md_path, json_path
 
 
 def _partial_file_fingerprint(path: Path, head_bytes: int = 65536) -> str:
@@ -4362,6 +5037,28 @@ def run_find_duplicates(folder: Path, args: argparse.Namespace) -> Path | None:
 
 
 def _configure_runtime_args(args: argparse.Namespace) -> int | None:
+    args.execution_profile = compact_spaces(getattr(args, "execution_profile", "balanced") or "balanced")
+    if args.execution_profile not in {"safe", "balanced", "aggressive"}:
+        args.execution_profile = "balanced"
+    args.safe_require_manual = args.execution_profile == "safe"
+    args._estimated_cost_spent = 0.0
+    if args.max_remote_calls_per_file < 0:
+        args.max_remote_calls_per_file = 0
+    if args.max_estimated_cost < 0:
+        args.max_estimated_cost = 0.0
+    if args.item_timeout_s < 0:
+        args.item_timeout_s = 0.0
+
+    if args.execution_profile == "safe":
+        args.source = "offline"
+        args.force_remote = False
+        args.search_speed = 5 if args.search_speed is None else args.search_speed
+    elif args.execution_profile == "aggressive":
+        args.source = "all"
+        args.force_remote = True
+        if args.search_speed is None and not args.fast and not args.thorough:
+            args.search_speed = 1
+
     if args.omit_console and args.review:
         log_error("--omit-console nao combina com --review (e preciso ver mensagens no terminal).")
         return 2
@@ -4524,10 +5221,35 @@ def _validate_main_modes(args: argparse.Namespace, roots: list[Path]) -> int | N
     if args.generate_catalog and (args.find_duplicates or args.dedup):
         log_error("--generate-catalog nao pode ser usado com --find-duplicates ou --dedup.")
         return 2
+    if args.deep_analysis and (args.apply or args.find_duplicates or args.dedup):
+        log_error("--deep-analysis nao combina com --apply, --find-duplicates ou --dedup.")
+        return 2
+    if args.planning_only and (args.apply or args.find_duplicates or args.dedup or args.deep_analysis):
+        log_error("--planning-only nao combina com --apply, dedup/duplicates ou --deep-analysis.")
+        return 2
     return None
 
 
 def _execute_main_flow(args: argparse.Namespace, roots: list[Path]) -> int:
+    if args.planning_only:
+        n_roots_pl = len(roots)
+        for folder in roots:
+            if n_roots_pl > 1 and not args.quiet:
+                log_info(f"\n--- planning-only: {folder} ---")
+            mdp, jsp = run_planning_on_root(folder, args)
+            log_info(f"Planejamento salvo em: {mdp}")
+            log_info(f"Planejamento (JSON) salvo em: {jsp}")
+        return 0
+
+    if args.deep_analysis:
+        n_roots_da = len(roots)
+        for folder in roots:
+            if n_roots_da > 1 and not args.quiet:
+                log_info(f"\n--- deep-analysis: {folder} ---")
+            analysis_path = run_deep_analysis_on_root(folder, args)
+            log_info(f"Analise profunda salva em: {analysis_path}")
+        return 0
+
     if args.find_duplicates:
         if args.apply or args.review:
             log_error("--find-duplicates nao combina com --apply nem com --review.")
@@ -4663,6 +5385,83 @@ def main() -> int:
             "Revisao interactiva item a item quando a pontuacao de concordancia local/remoto for "
             "70-89 (revisar) ou <70 (duvidoso): aceitar, editar nome, pular ou gravar override do "
             "autor na sessao. Gera review_needed.csv. Incompativel com --apply."
+        ),
+    )
+    ap.add_argument(
+        "--deep-review",
+        action="store_true",
+        help=(
+            "Revisao interactiva aprofundada de TODOS os itens (nao apenas os duvidosos). "
+            "Ativa automaticamente --review e gera deep_review.csv com comparativo local vs final."
+        ),
+    )
+    ap.add_argument(
+        "--execution-profile",
+        choices=["safe", "balanced", "aggressive"],
+        default="balanced",
+        help=(
+            "Perfil pronto de execucao: safe (sem rede e revisao forte), "
+            "balanced (padrao atual), aggressive (mais remoto e mais tolerante a fallback)."
+        ),
+    )
+    ap.add_argument(
+        "--quarantine",
+        action="store_true",
+        help=(
+            "Ativa quarentena operacional por execucao: cria originals/, failed/ e converted/ em renamed/; "
+            "faz backup pre-renomeio e move falhas para failed/."
+        ),
+    )
+    ap.add_argument(
+        "--persist-intermediate",
+        action="store_true",
+        help="Persiste artefato da fase de extracao->decisao em renamed/phase_artifacts.json.",
+    )
+    ap.add_argument(
+        "--max-remote-calls-per-file",
+        type=int,
+        default=0,
+        metavar="N",
+        help="Limita quantas fontes remotas podem ser usadas por arquivo (0 = sem limite).",
+    )
+    ap.add_argument(
+        "--max-estimated-cost",
+        type=float,
+        default=0.0,
+        metavar="VALOR",
+        help="Limite de custo estimado por lote para consultas remotas/IA (0 = sem limite).",
+    )
+    ap.add_argument(
+        "--item-timeout-s",
+        type=float,
+        default=0.0,
+        metavar="SEGUNDOS",
+        help="Timeout total por item; se exceder, cai para decisao conservadora local (0 = sem limite).",
+    )
+    ap.add_argument(
+        "--planning-only",
+        action="store_true",
+        help="Somente planejamento: classifica risco e recomendacao sem gerar nome final.",
+    )
+    ap.add_argument(
+        "--author-aliases",
+        default="",
+        metavar="ARQUIVO.json",
+        help="JSON opcional de aliases canonicos de autor (chave -> valor canonicizado).",
+    )
+    ap.add_argument(
+        "--deep-analysis",
+        action="store_true",
+        help=(
+            "Executa analise aprofundada item a item (IA quando configurada) e grava apenas "
+            "deep_analysis.md ao final."
+        ),
+    )
+    ap.add_argument(
+        "--deep-analysis-review",
+        action="store_true",
+        help=(
+            "Com --deep-analysis, pede comentario manual por item e inclui no Markdown final."
         ),
     )
     ap.add_argument(
@@ -5012,6 +5811,10 @@ def main() -> int:
 
     args = ap.parse_args()
     args.review_author_lock = {}
+    if args.deep_review:
+        args.review = True
+    if args.deep_analysis_review:
+        args.deep_analysis = True
     rc = _configure_runtime_args(args)
     if rc is not None:
         return rc

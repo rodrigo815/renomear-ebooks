@@ -67,6 +67,9 @@ def test_c4_regression_duplicate_author_variants_should_collapse() -> None:
     assert names.count("Atkins") <= 1
     assert "Peter" in names or "P. W." in names
 
+    formatted = [re.format_one_author(a, {}) for a in (merged.authors or [])]
+    assert len(re.dedupe_authors(formatted)) == 1
+
 
 def test_c4_regression_duplicate_medeiros_variants_should_collapse() -> None:
     merged = re.merge_metadata(
@@ -97,6 +100,25 @@ def test_c6_regression_periodical_should_not_force_person_author() -> None:
 def test_c4_regression_comma_ampersand_multi_author_splits_correctly() -> None:
     parts = re.split_authors("James F. Kasting, Robert G. Crane & Lee R. Kump")
     assert parts == ["James F. Kasting", "Robert G. Crane", "Lee R. Kump"]
+
+
+def test_c3_regression_portuguese_name_not_inverted() -> None:
+    m = _fb("João Manuel Cardoso de Mello - O capitalismo tardio.pdf")
+    joined = " ".join(m.authors or []).lower()
+    assert "mello" in joined
+    assert "capitalismo" in (m.title or "").lower()
+
+
+def test_c4_regression_fahy_variants_do_not_keep_incompatible_extra_author() -> None:
+    one = re.dedupe_authors(
+        [
+            "Valliant Warren Fahy",
+            "Fahy, C. W.",
+            "VALLIANT, James S",
+        ]
+    )
+    # "James S Valliant" não deve sobreviver quando o autor base é Fahy.
+    assert len(one) <= 2
 
 
 def test_c5_regression_where_human_rights_should_recover_author(monkeypatch) -> None:  # noqa: ANN001

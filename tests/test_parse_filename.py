@@ -284,3 +284,25 @@ class TestFallbackNestedEditorialParens:
         m = _fb("Freud Evaluated The Completed Arc (Malcolm Macmillan (Eds.)).pdf")
         assert m.authors
         assert any("macmillan" in a.lower() for a in m.authors)
+
+
+class TestOperationalProfilesAndNormalization:
+    def test_normalize_final_filename_collapses_artifacts(self) -> None:
+        out = re._normalize_final_filename("  Nome  --  Titulo  -- .pdf")
+        assert "  " not in out
+        assert "--" not in out
+        assert out.endswith(".pdf")
+
+    def test_classify_item_kind_report(self) -> None:
+        p = Path("CIA Information Report - algo.pdf")
+        local = re.BookMeta(str(p), title="Information Report", authors=[], year="")
+        meta = re.BookMeta(str(p), title="Information Report", authors=[], year="")
+        kind, conf = re.classify_item_kind(p, local, meta)
+        assert kind == "report"
+        assert conf >= 0.7
+
+    def test_make_new_filename_non_book_conservative(self) -> None:
+        m = re.BookMeta("x.pdf", title="Soviet Cybernetics Review", authors=["Autor Incerto"], year="1999")
+        nm = re.make_new_filename(m, ".pdf", {}, 3, "sd", item_kind="magazine")
+        assert "Autor" not in nm
+        assert "1999" in nm

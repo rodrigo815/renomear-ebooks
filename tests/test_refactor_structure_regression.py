@@ -27,6 +27,16 @@ def _build_args(**overrides) -> argparse.Namespace:
         "find_duplicates": False,
         "dedup": False,
         "generate_catalog": False,
+        "deep_analysis": False,
+        "deep_analysis_review": False,
+        "execution_profile": "balanced",
+        "quarantine": False,
+        "persist_intermediate": False,
+        "max_remote_calls_per_file": 0,
+        "max_estimated_cost": 0.0,
+        "item_timeout_s": 0.0,
+        "planning_only": False,
+        "author_aliases": "",
         "apply": False,
         "move_duplicates": False,
         "prefer_larger": False,
@@ -116,7 +126,69 @@ def test_structural_configure_runtime_args_fast_profile() -> None:
     assert args.enabled_remote_sources == re.SEARCH_SPEED_TO_SOURCES[5]
 
 
+def test_structural_configure_runtime_args_execution_profile_safe() -> None:
+    args = _build_args(execution_profile="safe", source="all", force_remote=True)
+    rc = re._configure_runtime_args(args)
+    assert rc is None
+    assert args.source == "offline"
+    assert args.safe_require_manual is True
+
+
+def test_structural_configure_runtime_args_execution_profile_aggressive() -> None:
+    args = _build_args(execution_profile="aggressive", source="offline", search_speed=None)
+    rc = re._configure_runtime_args(args)
+    assert rc is None
+    assert args.source == "all"
+    assert args.force_remote is True
+
+
 def test_structural_validate_main_modes_conflict() -> None:
     args = _build_args(apply=True, review=True)
     rc = re._validate_main_modes(args, [Path(".").resolve()])
     assert rc == 2
+
+
+def test_structural_validate_main_modes_deep_analysis_conflict() -> None:
+    args = _build_args(deep_analysis=True, apply=True)
+    rc = re._validate_main_modes(args, [Path(".").resolve()])
+    assert rc == 2
+
+
+def test_structural_execute_main_flow_deep_analysis(monkeypatch, tmp_path: Path) -> None:
+    calls: list[Path] = []
+
+    def _fake_run(folder: Path, args: argparse.Namespace) -> Path:
+        calls.append(folder)
+        return folder / "renamed" / "deep_analysis.md"
+
+    monkeypatch.setattr(re, "run_deep_analysis_on_root", _fake_run)
+    args = _build_args(deep_analysis=True, quiet=True)
+    rc = re._execute_main_flow(args, [tmp_path])
+    assert rc == 0
+    assert calls == [tmp_path]
+
+
+def test_structural_execute_main_flow_planning_only(monkeypatch, tmp_path: Path) -> None:
+    calls: list[Path] = []
+
+    def _fake_run(folder: Path, args: argparse.Namespace) -> tuple[Path, Path]:
+        calls.append(folder)
+        return folder / "renamed" / "planning_only.md", folder / "renamed" / "planning_only.json"
+
+    monkeypatch.setattr(re, "run_planning_on_root", _fake_run)
+    args = _build_args(planning_only=True, quiet=True)
+    rc = re._execute_main_flow(args, [tmp_path])
+    assert rc == 0
+    assert calls == [tmp_path]
+
+
+def test_structural_deep_analysis_json_schema_fallback() -> None:
+    meta = re.BookMeta("x.pdf", title="T", authors=["A"], year="2000")
+    meta.match_score = 50
+    out = re._coerce_deep_analysis_json({"risk": "r"}, meta)
+    assert set(out.keys()) >= {"risk", "likely_cause", "action", "confidence", "notes"}
+
+
+def test_structural_estimate_sources_cost_nonzero() -> None:
+    c = re._estimate_sources_cost(frozenset({"openlibrary", "google"}))
+    assert c > 0.0
