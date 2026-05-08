@@ -4517,7 +4517,11 @@ def run_on_root(
 
         line = f"{status}: {path.name} -> {Path(target).name}"
         if not args.quiet:
-            log_info(line)
+            if getattr(args, "only_review_needed", False):
+                if status == "revisao_necessaria":
+                    log_info(line)
+            else:
+                log_info(line)
 
         if getattr(args, "review", False) and (review_all or band != "auto"):
             review_needed_rows.append(
@@ -5700,6 +5704,14 @@ def main() -> int:
         "--only-missing-year",
         action="store_true",
         help="Filtra para arquivos cujo metadado LOCAL nao trouxe ano (antes da etapa remota).",
+    )
+    ap.add_argument(
+        "--only-review-needed",
+        action="store_true",
+        help=(
+            "No console, imprime apenas linhas com status revisao_necessaria (nao altera CSVs "
+            "nem o processamento). Respeita --quiet."
+        ),
     )
     ap.add_argument(
         "--force-remote",

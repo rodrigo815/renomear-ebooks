@@ -3,9 +3,13 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import subprocess
+import sys
 from pathlib import Path
 
 import renomear_ebooks as re
+
+_REPO_ROOT = Path(__file__).resolve().parent.parent
 
 
 def _args_for_run_on_root(**overrides) -> argparse.Namespace:
@@ -39,6 +43,7 @@ def _args_for_run_on_root(**overrides) -> argparse.Namespace:
         "catalog_format": "json",
         "review_author_lock": {},
         "only_missing_year": False,
+        "only_review_needed": False,
     }
     base.update(overrides)
     return argparse.Namespace(**base)
@@ -82,6 +87,96 @@ def test_run_on_root_marks_revisao_necessaria_on_failure_and_low_score(
     assert rows[0]["status"] == "revisao_necessaria"
     failures = json.loads(rows[0]["source_failures"])
     assert failures and failures[0]["source"] == "openlibrary"
+
+
+def _install_two_file_mocks_for_console_filter(tmp_path: Path, monkeypatch) -> None:  # noqa: ANN001
+    bad = tmp_path / "bad.pdf"
+    good = tmp_path / "Autor X - 2001 - Livro Y.pdf"
+    bad.write_bytes(b"b")
+    good.write_bytes(b"g")
+
+    def _fake_build_local_metadata(files, **kwargs):  # noqa: ANN002, ANN003
+        out = []
+        for p in sorted(files, key=lambda x: x.name):
+            if p.name == "bad.pdf":
+                out.append(
+                    (
+                        p,
+                        re.BookMeta(
+                            str(p),
+                            title="Titulo Local",
+                            authors=["Autor Local"],
+                            year="",
+                            source="filename",
+                        ),
+                    )
+                )
+            else:
+                out.append(
+                    (
+                        p,
+                        re.BookMeta(
+                            str(p),
+                            title="Livro Y",
+                            authors=["Autor X"],
+                            year="2001",
+                            source="filename",
+                        ),
+                    )
+                )
+        return out
+
+    def _fake_lookup_metadata(meta, *args, **kwargs):  # noqa: ANN002, ANN003
+        if Path(meta.path).name == "bad.pdf":
+            return re.BookMeta(
+                str(meta.path),
+                title="Outro Titulo",
+                authors=["Outro Autor"],
+                year="2001",
+                source="openlibrary",
+                confidence=0.55,
+                source_failures=[
+                    {"source": "openlibrary", "reason": "timeout", "action": "ignored_source_and_continued"}
+                ],
+            )
+        return meta
+
+    monkeypatch.setattr(re, "build_local_metadata", _fake_build_local_metadata)
+    monkeypatch.setattr(re, "lookup_metadata", _fake_lookup_metadata)
+
+
+def test_only_review_needed_filters_per_file_console_lines(tmp_path: Path, monkeypatch) -> None:
+    _install_two_file_mocks_for_console_filter(tmp_path, monkeypatch)
+    logged: list[str] = []
+    monkeypatch.setattr(re, "log_info", lambda m: logged.append(m))
+    args = _args_for_run_on_root(quiet=False, only_review_needed=True)
+    re.run_on_root(tmp_path, args)
+    per_file = [m for m in logged if " -> " in m]
+    assert len(per_file) == 1
+    assert "revisao_necessaria" in per_file[0]
+    assert "bad.pdf" in per_file[0]
+
+
+def test_without_only_review_needed_logs_all_per_file_lines(tmp_path: Path, monkeypatch) -> None:
+    _install_two_file_mocks_for_console_filter(tmp_path, monkeypatch)
+    logged: list[str] = []
+    monkeypatch.setattr(re, "log_info", lambda m: logged.append(m))
+    args = _args_for_run_on_root(quiet=False, only_review_needed=False)
+    re.run_on_root(tmp_path, args)
+    per_file = [m for m in logged if " -> " in m]
+    assert len(per_file) == 2
+
+
+def test_help_lists_only_review_needed_flag() -> None:
+    proc = subprocess.run(
+        [sys.executable, str(_REPO_ROOT / "renomear_ebooks.py"), "--help"],
+        capture_output=True,
+        text=True,
+        check=False,
+        cwd=str(_REPO_ROOT),
+    )
+    assert proc.returncode == 0
+    assert "--only-review-needed" in proc.stdout
 
 
 def test_unique_target_handles_multiple_collisions(tmp_path: Path) -> None:

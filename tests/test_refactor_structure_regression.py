@@ -37,6 +37,7 @@ def _build_args(**overrides) -> argparse.Namespace:
         "item_timeout_s": 0.0,
         "planning_only": False,
         "author_aliases": "",
+        "only_review_needed": False,
         "apply": False,
         "move_duplicates": False,
         "prefer_larger": False,
