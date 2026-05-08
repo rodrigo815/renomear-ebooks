@@ -233,6 +233,27 @@ class TestPortalNoiseAndParentheticals:
         m = re.parse_filename_fallback(Path("Godless (Traduzido).pdf"))
         assert not m.authors
 
+    def test_zlibrary_habermas_filename_noise_removed(self) -> None:
+        m = re.parse_filename_fallback(
+            Path(
+                "Teoria do Agir Comunicativo - Racionalidade da ação e racionalização social "
+                "(Jürgen Habermas) (z-library.sk, 1lib.sk, z-lib.sk).pdf"
+            )
+        )
+        assert any("habermas" in a.lower() for a in (m.authors or []))
+        assert "z-library" not in (m.title or "").lower()
+        assert "1lib" not in (m.title or "").lower()
+        assert "z-lib" not in (m.title or "").lower()
+
+    def test_dokumen_pub_prefix_and_isbn_suffix_removed(self) -> None:
+        m = re.parse_filename_fallback(
+            Path("dokumen.pub_the-last-pagans-of-rome-0199780919-9780199780914.pdf")
+        )
+        title = (m.title or "").lower()
+        assert "dokumen.pub" not in title
+        assert "the-last-pagans-of-rome" in title or "the last pagans of rome" in title
+        assert "9780199780914" not in title
+
 
 class TestFormatRussianStyleInitials:
     def test_batischev_g_s(self) -> None:

@@ -382,10 +382,14 @@ _CIA_REGISTRY_TAIL_RE = re.compile(
     re.I,
 )
 
+_DOKUMEN_PREFIX_RE = re.compile(r"^\s*dokumen\.pub[_\-\s]+", re.I)
+_ISBN_TAIL_RE = re.compile(r"(?:[-_\s]+(?:97[89]\d{10}|\d{10})){1,3}\s*$")
+
 
 def _sanitize_filename_stem_noise(st: str) -> str:
     """Remove sufixos de portal (Z-Library etc.) e referencias CIA-RDP do stem antes do parse."""
     s = compact_spaces(st)
+    s = _DOKUMEN_PREFIX_RE.sub("", s)
     while True:
         prev = s
         s = _PORTAL_SUFFIX_RE.sub("", s)
@@ -393,6 +397,7 @@ def _sanitize_filename_stem_noise(st: str) -> str:
         if s == prev:
             break
     s = _CIA_REGISTRY_TAIL_RE.sub("", s)
+    s = _ISBN_TAIL_RE.sub("", s)
     return compact_spaces(s)
 
 

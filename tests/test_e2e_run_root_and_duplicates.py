@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import re as regex
 import subprocess
 import sys
 from pathlib import Path
@@ -177,6 +178,22 @@ def test_help_lists_only_review_needed_flag() -> None:
     )
     assert proc.returncode == 0
     assert "--only-review-needed" in proc.stdout
+
+
+def test_help_lists_all_long_flags_from_parser_source() -> None:
+    source = (_REPO_ROOT / "renomear_ebooks.py").read_text(encoding="utf-8")
+    expected_flags = sorted(set(regex.findall(r"\"(--[a-z0-9][a-z0-9\\-]*)\"", source)))
+    proc = subprocess.run(
+        [sys.executable, str(_REPO_ROOT / "renomear_ebooks.py"), "--help"],
+        capture_output=True,
+        text=True,
+        check=False,
+        cwd=str(_REPO_ROOT),
+    )
+    assert proc.returncode == 0
+    # Cada flag de linha de comando declarada no parser precisa aparecer no help.
+    missing = [flag for flag in expected_flags if flag not in proc.stdout]
+    assert not missing, f"Flags ausentes no --help: {missing}"
 
 
 def test_unique_target_handles_multiple_collisions(tmp_path: Path) -> None:
