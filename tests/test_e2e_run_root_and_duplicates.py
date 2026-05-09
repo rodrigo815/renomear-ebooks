@@ -168,6 +168,38 @@ def test_without_only_review_needed_logs_all_per_file_lines(tmp_path: Path, monk
     assert len(per_file) == 2
 
 
+def test_console_line_uses_simulacao_label_for_planned_rename(tmp_path: Path, monkeypatch) -> None:
+    """No console, dry-run usa 'simulacao' (README); CSV mantem status planejado."""
+    good = tmp_path / "Autor X - 2001 - Livro Y.pdf"
+    good.write_bytes(b"g")
+
+    def _fake_build_local_metadata(files, **kwargs):  # noqa: ANN002, ANN003
+        p = files[0]
+        return [
+            (
+                p,
+                re.BookMeta(
+                    str(p),
+                    title="Livro Y",
+                    authors=["Autor X"],
+                    year="2001",
+                    source="filename",
+                ),
+            )
+        ]
+
+    monkeypatch.setattr(re, "build_local_metadata", _fake_build_local_metadata)
+    monkeypatch.setattr(re, "lookup_metadata", lambda *a, **k: a[0])  # offline identity
+
+    logged: list[str] = []
+    monkeypatch.setattr(re, "log_info", lambda m: logged.append(m))
+    args = _args_for_run_on_root(quiet=False, apply=False)
+    re.run_on_root(tmp_path, args)
+    per_file = [m for m in logged if " -> " in m]
+    assert len(per_file) >= 1
+    assert any(x.startswith("simulacao:") and "Livro" in x for x in per_file)
+
+
 def test_help_lists_only_review_needed_flag() -> None:
     proc = subprocess.run(
         [sys.executable, str(_REPO_ROOT / "renomear_ebooks.py"), "--help"],

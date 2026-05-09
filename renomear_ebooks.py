@@ -214,6 +214,25 @@ BAD_TITLE_WORDS = {
     "unknown", "untitled", "document", "scan", "scanner", "converted",
 }
 
+# Sobrenomes/cognomes frequentes em ficheiros "Marx - Titulo.pdf" / "Gramsci - Titulo.pdf";
+# usado em heuristicas de bipartido e parentese final (editora vs coautor).
+AUTHOR_ONE_WORD_SURNAMES = frozenset(
+    {
+        "marx",
+        "engels",
+        "lenin",
+        "darwin",
+        "nietzsche",
+        "gramsci",
+        "freud",
+        "kant",
+        "hegel",
+        "sartre",
+        "weber",
+        "arendt",
+    }
+)
+
 
 @dataclass
 class BookMeta:
@@ -979,7 +998,7 @@ def _can_split_author_conjunction(left: str, right: str) -> bool:
     lw, rw = len(l.split()), len(r.split())
     if not (1 <= lw <= 4 and 1 <= rw <= 4):
         return False
-    strong_mononyms = {"marx", "engels", "lenin", "darwin", "nietzsche"}
+    strong_mononyms = AUTHOR_ONE_WORD_SURNAMES
     if lw == 1 and rw == 1:
         if normalize_for_match(l) not in strong_mononyms or normalize_for_match(r) not in strong_mononyms:
             return False
@@ -1193,7 +1212,7 @@ def _resolve_two_segments_to_authors_and_title(left: str, right: str) -> tuple[l
 
     la, ra = _segment_author_likelihood(left), _segment_author_likelihood(right)
     lt, rt = _segment_title_likelihood(left), _segment_title_likelihood(right)
-    strong_mononyms = {"marx", "engels", "lenin", "darwin", "nietzsche"}
+    strong_mononyms = AUTHOR_ONE_WORD_SURNAMES
     nl, nr = normalize_for_match(left), normalize_for_match(right)
 
     def _looks_like_person_name_segment(seg: str) -> bool:
@@ -1209,7 +1228,13 @@ def _resolve_two_segments_to_authors_and_title(left: str, right: str) -> tuple[l
             return False
         if not (1 <= len(toks) <= 6):
             return False
-        return bool(re.search(r"[A-Za-zÀ-ÿ]", s))
+        if not re.search(r"[A-Za-zÀ-ÿ]", s):
+            return False
+        al = _segment_author_likelihood(s)
+        tl = _segment_title_likelihood(s)
+        if tl > al + 0.06:
+            return False
+        return True
 
     left_personish = _looks_like_person_name_segment(left)
     right_personish = _looks_like_person_name_segment(right)
@@ -1417,6 +1442,38 @@ def _parse_filename_simple_parenthetical(
             title = stem
             authors = []
     else:
+        base = m.group(1)
+        pair = _bipartite_split_once(base)
+        if pair:
+            left, right = pair
+            authors_bt, title_bt = _resolve_two_segments_to_authors_and_title(left, right)
+            if authors_bt and title_bt:
+                inner_st = compact_spaces(inner)
+                in_toks = inner_st.split()
+                left_st = pair[0]
+                n_inner = normalize_for_match(inner_st)
+                l_ntoks = left_st.split()
+                if (
+                    len(in_toks) == 1
+                    and n_inner not in AUTHOR_ONE_WORD_SURNAMES
+                    and (
+                        len(l_ntoks) >= 2
+                        or (
+                            len(l_ntoks) == 1
+                            and normalize_for_match(l_ntoks[0]) in AUTHOR_ONE_WORD_SURNAMES
+                        )
+                    )
+                ):
+                    return BookMeta(
+                        str(path),
+                        clean_title(title_bt),
+                        authors_bt,
+                        year,
+                        source="filename",
+                        confidence=0.32,
+                        filename_paren_year=filename_paren_year,
+                        publisher=inner_st,
+                    )
         title = m.group(1)
         authors = split_authors(inner)
     return BookMeta(
@@ -3103,8 +3160,19 @@ def classify_item_kind(path: Path, local: BookMeta, meta: BookMeta) -> tuple[str
         return "report", 0.85
     if re.search(r"\b(review|journal|proceedings|paper|article)\b", txt):
         return "article", 0.72
-    if re.search(r"\b(vol\.?|volume|no\.?|n\.|issue|revista|magazine)\b", txt):
-        return "magazine", 0.7
+    # Revista/periodico: evitar falsos positivos — "vol"/"volume" e comum em livros
+    # (cadernos, tomos); em PT \bno.? batia em "no Brasil" (no != numero).
+    if re.search(r"\b(revista|magazine|periodico|gazette|fanzine)\b", txt):
+        return "magazine", 0.72
+    if re.search(r"\b(vol\.?|volume)\b", txt) and re.search(
+        r"\b("
+        r"journal|magazine|revista|proceedings|issue|iss\.|"
+        r"numero|n[uú]mero|"
+        r"no\.\s*\d|n[ºo°]\s*\d|#\s*\d+"
+        r")\b",
+        txt,
+    ):
+        return "magazine", 0.68
     if (meta.authors and meta.title) or (local.authors and local.title):
         return "book", 0.72
     if meta.title or local.title:
@@ -4359,6 +4427,16 @@ def _extract_signals_for_item(
     return meta, signals
 
 
+def _console_label_for_rename_status(status: str) -> str:
+    """Rotulo amigavel no console; CSV/planos continuam com status tecnico (ex.: planejado)."""
+    return {
+        "planejado": "simulacao",
+        "renomeado": "renomeado",
+        "igual": "inalterado",
+        "pulado_revisao": "pulado_revisao",
+    }.get(status, status)
+
+
 def run_on_root(
     folder: Path, args: argparse.Namespace
 ) -> tuple[int, int, Path, Path, Path | None, Path | None]:
@@ -4520,7 +4598,7 @@ def run_on_root(
                 }
             )
 
-        line = f"{status}: {path.name} -> {Path(target).name}"
+        line = f"{_console_label_for_rename_status(status)}: {path.name} -> {Path(target).name}"
         if not args.quiet:
             if getattr(args, "only_review_needed", False):
                 if status == "revisao_necessaria":

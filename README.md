@@ -126,7 +126,8 @@ python renomear_ebooks.py "E:\Livros" --exts "pdf,epub,.mobi"
   - `--limit N`: limita a quantidade de arquivos por pasta (ordem alfabética).
   - `--jobs N`: define paralelismo da leitura local (PDF/EPUB).
   - `--quiet`: reduz logs de progresso no console.
-  - `--only-review-needed`: no console, só imprime linhas cujo status é `revisao_necessaria` (CSV/processamento inalterados).
+  - Linha por ficheiro (sem `--quiet`): `simulacao: nome.pdf -> renamed/NOVO.pdf` quando ainda nao ha `--apply` (no CSV a coluna `status` continua `planejado`); com `--apply` e sucesso, `renomeado: ...`. Nome final segue o padrao documentado: **SOBRENOME, Nome - Ano - Titulo** (ou `--filename-pattern`).
+  - `--only-review-needed`: no console, só imprime linhas cujo status técnico é `revisao_necessaria` (CSV/processamento inalterados).
   - `--omit-console`: silencia logs de console (exceto fatal); incompatível com `--review`.
   - `--planning-only`: só classifica risco e recomenda ação; não gera nome final.
 - Aplicação/revisão:
